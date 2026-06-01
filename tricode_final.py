@@ -1,13 +1,13 @@
 """TriQR CLI entrypoint.
 
 Feature-specific code lives in:
-  - triqr_common.py
-  - triqr_render.py
-  - triqr_security.py
-  - triqr_payload.py
-  - triqr_detect.py
-  - triqr_encode.py
-  - triqr_visualize.py
+  - tricode_common.py
+  - tricode_render.py
+  - tricode_security.py
+  - tricode_payload.py
+  - tricode_detect.py
+  - tricode_encode.py
+  - tricode_visualize.py
 """
 
 import getpass
@@ -17,14 +17,13 @@ import sys
 import numpy as np
 from PIL import Image
 
-from triqr_common import HERE
-from triqr_detect import detect, _warp_gray
-from triqr_decode import decode_image as decode_payload_image
-from triqr_encode import encode, _layout
-from triqr_payload import build_payload
-from triqr_render import load_templates, save_templates
-from triqr_security import cmd_enroll, list_enrolled_names
-from triqr_visualize import visualize
+from tricode_common import HERE
+from tricode_detect import detect, _warp_gray
+from tricode_decode import decode_image as decode_payload_image
+from tricode_encode import encode
+from tricode_render import load_templates, save_templates
+from tricode_security import cmd_enroll, list_enrolled_names
+from tricode_visualize import visualize
 
 
 def main():
@@ -46,14 +45,18 @@ def main():
             if not names: print("먼저 enroll 실행"); return
             sn=names[0] if len(names)==1 else input(f"사용자({', '.join(names)}): ").strip()
             sp=getpass.getpass(f"'{sn}' 비밀번호: ")
-        img=encode(text,sign_name=sn,sign_pw=sp)
+        img, meta = encode(text, sign_name=sn, sign_pw=sp, return_info=True)
         img.save(out)
-        payload=build_payload(text,sn,sp) if sn else build_payload(text)
-        nd=len(payload); side,nsym=_layout(nd)
         print(f"[encode] {out!r}")
         print(f"  텍스트 : {text!r}")
-        print(f"  페이로드: {nd}B  ECC: {nsym}B  그리드: {side}×{side}")
-        if sn: print(f"  서명   : {sn} (HMAC-SHA256/16B)")
+        print(f"  페이로드: {meta['payload_len']}B  ECC: {meta['ecc_len']}B  그리드: {meta['grid_side']}×{meta['grid_side']}")
+        print(f"  ECC비율 : {meta['ecc_ratio']:.2f}")
+        if meta["compression"] == "deflate":
+            pct = 100.0 * (1.0 - meta["compression_ratio"])
+            print(f"  압축   : raw deflate L{meta['compression_level']}  절감 {pct:.1f}%")
+        else:
+            print("  압축   : 생략 (압축 이득 없음)")
+        if meta["signed"]: print(f"  서명   : {meta['signer']} (HMAC-SHA256/16B)")
 
     # ── detect ──
     elif cmd=='detect':

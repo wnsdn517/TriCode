@@ -14,7 +14,7 @@ try:
 except ImportError:
     _FERNET = False
 
-from triqr_common import KEYS_DIR, SERVER_DB, SIG_LEN
+from tricode_common import KEYS_DIR, SERVER_DB, SIG_LEN
 
 
 def _db_load():

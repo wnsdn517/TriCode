@@ -4,7 +4,7 @@ import math
 
 from PIL import Image, ImageDraw
 
-from triqr_common import CORNER_COLORS
+from tricode_common import CORNER_COLORS
 
 
 def visualize(img, anchors, enhanced, binary, rect, decode_result=None, out_path=None):

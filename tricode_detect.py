@@ -1,6 +1,7 @@
 """Anchor detection and geometric reconstruction."""
 
 import math
+from functools import lru_cache
 
 import numpy as np
 from PIL import Image
@@ -13,16 +14,30 @@ except ImportError:
     _CV2 = False
     cv2 = None
 
-from triqr_common import ANCHOR_PATTERNS, ANCHOR_SIZE, ANCHOR_BUF, CORNER_COLORS, _IVEC
-from triqr_render import load_templates, render_anchor
+from tricode_common import ANCHOR_PATTERNS, ANCHOR_SIZE, ANCHOR_BUF, CORNER_COLORS, _IVEC
+from tricode_render import load_templates, render_anchor
+
+
+@lru_cache(maxsize=2)
+def _get_clahe(photo_mode=False):
+    clip = 2.0 if not photo_mode else 2.5
+    tile = (8, 8) if not photo_mode else (6, 6)
+    return cv2.createCLAHE(clipLimit=clip, tileGridSize=tile)
+
+
+@lru_cache(maxsize=1)
+def _get_coarse_templates(scale=0.5):
+    return {
+        c: [(render_anchor(c, max(4, round(cpx * scale)), n90), n90) for n90 in range(4) for cpx in [8, 12, 16, 20, 24, 30]]
+        for c in ("TL", "TR", "BL", "BR")
+    }
 
 
 def preprocess(gray_or_bgr, photo_mode=False):
     if not _CV2:
         raise RuntimeError("pip install opencv-python")
     g = cv2.cvtColor(gray_or_bgr, cv2.COLOR_BGR2GRAY) if gray_or_bgr.ndim == 3 else gray_or_bgr.copy()
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enh = clahe.apply(g)
+    enh = _get_clahe(photo_mode).apply(g)
     if photo_mode:
         blur = cv2.GaussianBlur(enh, (0, 0), 1.5)
         enh = np.clip(cv2.addWeighted(enh, 1.8, blur, -0.8, 0), 0, 255).astype(np.uint8)
@@ -153,14 +168,11 @@ def detect_anchors(gray, templates, thresh_init=0.60, photo_mode=False):
     best_anchors = best
 
     scale = 0.5
-    g_s = cv2.resize(gray, (int(w * scale), int(h * scale)))
-    mini = {
-        c: [(render_anchor(c, max(4, round(cpx * scale)), n90), n90) for n90 in range(4) for cpx in [8, 12, 16, 20, 24, 30]]
-        for c in ("TL", "TR", "BL", "BR")
-    }
+    mini = _get_coarse_templates(scale)
     coarse_thresh = min(thresh_init, 0.50)
 
-    for ang in [5, -5, 10, -10, 15, -15, 20, -20, 25, -25, 30, -30, 35, -35, 40, -40, 45, -45]:
+    # Coarse sweep uses wider steps to cut the number of expensive warps/matches.
+    for ang in [0, -10, 10, -20, 20, -30, 30, -40, 40]:
         gs = _warp_gray(gray, ang)
         gs_s = cv2.resize(gs, (int(w * scale), int(h * scale)))
         _, bs = preprocess(gs_s, photo_mode)
@@ -172,7 +184,7 @@ def detect_anchors(gray, templates, thresh_init=0.60, photo_mode=False):
         if best_n == 4:
             break
 
-    for ang in range(best_ang - 4, best_ang + 5):
+    for ang in range(best_ang - 3, best_ang + 4):
         gs = _warp_gray(gray, ang) if ang else gray
         _, bs = preprocess(gs, photo_mode)
         a = _match_binary(bs, templates, thresh_init, photo_mode)

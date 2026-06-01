@@ -2,6 +2,8 @@
 GF(2^8) Reed-Solomon — 순수 Python (BM + Forney)
 생성 다항식: x^8 + x^4 + x^3 + x^2 + 1  (0x11d)
 """
+from functools import lru_cache
+
 PRIM=0x11d; GF=256
 EXP=[0]*(GF*2); LOG=[0]*GF
 _x=1
@@ -12,7 +14,12 @@ for _i in range(GF-1):
 for _i in range(GF-1,GF*2): EXP[_i]=EXP[_i-(GF-1)]
 del _x,_i
 
-def gm(a,b): return EXP[(LOG[a]+LOG[b])%(GF-1)] if a and b else 0
+_MUL = [
+    bytes((EXP[(LOG[a] + LOG[b]) % (GF - 1)] if a and b else 0) for b in range(GF))
+    for a in range(GF)
+]
+
+def gm(a,b): return _MUL[a][b]
 def gi(a):   return EXP[(GF-1)-LOG[a]]
 def gp(a,e): return EXP[(LOG[a]*e)%(GF-1)] if a else 0
 
@@ -27,6 +34,7 @@ def pm(a,b):
         for j,v in enumerate(b): r[i+j]^=gm(u,v)
     return r
 
+@lru_cache(maxsize=None)
 def _gen(ns):
     g=[1]
     for i in range(ns): g=pm(g,[1,gp(2,i)])

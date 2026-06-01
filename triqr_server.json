@@ -1,6 +1,0 @@
-{
-  "tester": {
-    "algo": "hmac-sha256-16",
-    "key_file": "/data/data/com.termux/files/home/TriCode/triqr_keys/tester.key"
-  }
-}

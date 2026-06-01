@@ -1,11 +1,12 @@
 """Anchor rendering and template management."""
 
 import os
+from functools import lru_cache
 
 import numpy as np
 from PIL import Image, ImageDraw
 
-from triqr_common import ANCHOR_PATTERNS, ANCHOR_SIZE, TMPL_DIR, TRI_DL, TRI_DR, TRI_UL, TRI_UR
+from tricode_common import ANCHOR_PATTERNS, ANCHOR_SCHEMA, ANCHOR_SIZE, CELL_EMPTY, CELL_FULL, TMPL_DIR, TRI_DL, TRI_DR, TRI_UL, TRI_UR
 
 
 def _tri_pts(x0, y0, x1, y1, d):
@@ -18,9 +19,25 @@ def _tri_pts(x0, y0, x1, y1, d):
     return [(x0, y0), (x1, y1), (x0, y1)]
 
 
+def _draw_anchor_cell(draw, x0, y0, x1, y1, code):
+    if code == CELL_FULL:
+        draw.rectangle([x0, y0, x1, y1], fill=0)
+        return
+    if code == CELL_EMPTY:
+        return
+    draw.polygon(_tri_pts(x0, y0, x1, y1, code), fill=0)
+
+
 def _rotate_pat(pat, n90):
-    """Rotate the 2x2 anchor pattern clockwise by 90-degree steps."""
-    tmap = {TRI_UL: TRI_UR, TRI_UR: TRI_DR, TRI_DR: TRI_DL, TRI_DL: TRI_UL}
+    """Rotate the anchor pattern clockwise by 90-degree steps."""
+    tmap = {
+        TRI_UL: TRI_UR,
+        TRI_UR: TRI_DR,
+        TRI_DR: TRI_DL,
+        TRI_DL: TRI_UL,
+        CELL_FULL: CELL_FULL,
+        CELL_EMPTY: CELL_EMPTY,
+    }
     a = ANCHOR_SIZE
     p = [r[:] for r in pat]
     for _ in range(n90 % 4):
@@ -42,7 +59,7 @@ def render_anchor(corner, cell_px, n90=0):
         for dc in range(ANCHOR_SIZE):
             x0 = dc * cell_px
             y0 = dr * cell_px
-            d.polygon(_tri_pts(x0, y0, x0 + cell_px, y0 + cell_px, pat[dr][dc]), fill=0)
+            _draw_anchor_cell(d, x0, y0, x0 + cell_px, y0 + cell_px, pat[dr][dc])
     return np.array(img)
 
 
@@ -56,22 +73,26 @@ def save_templates(cell_px=20):
             for sc in _SCALES:
                 cpx = max(4, round(cell_px * sc))
                 arr = render_anchor(corner, cpx, n90)
-                Image.fromarray(arr).save(os.path.join(TMPL_DIR, f"{corner}_r{n90}_{cpx:03d}.png"))
+                Image.fromarray(arr).save(os.path.join(TMPL_DIR, f"{ANCHOR_SCHEMA}_{corner}_r{n90}_{cpx:03d}.png"))
     cnt = 4 * 4 * len(_SCALES)
-    print(f"[templates] {TMPL_DIR}  ({cnt}개)")
+    print(f"[templates] {TMPL_DIR}  {ANCHOR_SCHEMA}  ({cnt}개)")
 
 
-def load_templates():
+@lru_cache(maxsize=2)
+def load_templates(schema=ANCHOR_SCHEMA):
     """Return {corner: [(arr, n90), ...]}."""
     t = {c: [] for c in ANCHOR_PATTERNS}
     if os.path.isdir(TMPL_DIR):
         for fn in sorted(os.listdir(TMPL_DIR)):
             if not fn.endswith(".png"):
                 continue
-            p = fn[:-4].split("_")
-            if len(p) < 3:
+            base = fn[:-4]
+            if not base.startswith(schema + "_"):
                 continue
-            corner, n90 = p[0], int(p[1][1:])
+            p = base.split("_")
+            if len(p) < 4:
+                continue
+            corner, n90 = p[1], int(p[2][1:])
             if corner not in t:
                 continue
             arr = np.array(Image.open(os.path.join(TMPL_DIR, fn)).convert("L"))

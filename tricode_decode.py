@@ -11,10 +11,10 @@ from collections import deque
 import numpy as np
 from PIL import Image, ImageOps
 
-from rs_gf256 import rs_decode, rs_decode_erasure
-from triqr_common import ANCHOR_BUF, ANCHOR_SIZE, CELL_PX, ECC_RATIO, HERE, MARGIN, TRI_DL, TRI_DR, TRI_UL, TRI_UR
-from triqr_payload import parse_payload
-from triqr_render import load_templates
+from tricode_rs import rs_decode, rs_decode_erasure
+from tricode_common import ANCHOR_BUF, ANCHOR_SIZE, CELL_PX, HERE, MARGIN, TRI_DL, TRI_DR, TRI_UL, TRI_UR, codeword_permutation_inverse, codeword_unpermute, ecc_ratio_for_data
+from tricode_payload import parse_payload
+from tricode_render import load_templates, render_anchor
 
 try:
     import cv2
@@ -24,16 +24,16 @@ except ImportError:
     _CV2 = False
     cv2 = None
 
-try:
-    import triqr_v2 as _legacy
-except Exception:
-    _legacy = None
-
 CONF_THRESH = 25
 PHOTO_ROTATIONS = (0, -15, 15, -30, 30)
 PHOTO_THRESHOLDS = (80, 110, 140, 170, 200)
 PHOTO_DOWNSAMPLE = 8
 PHOTO_PAD = 4
+
+try:
+    _NEAREST = Image.Resampling.NEAREST
+except AttributeError:
+    _NEAREST = Image.NEAREST
 
 
 def _get_masks(px: int) -> dict:
@@ -51,6 +51,44 @@ def _image_bg_value(arr_gray: np.ndarray) -> float:
     s = max(1, min(h, w) // 10)
     corners = [arr_gray[:s, :s], arr_gray[:s, w - s :], arr_gray[h - s :, :s], arr_gray[h - s :, w - s :]]
     return float(np.mean([c.mean() for c in corners]))
+
+
+def _otsu_threshold(arr_gray: np.ndarray) -> int:
+    hist = np.bincount(arr_gray.astype(np.uint8).ravel(), minlength=256).astype(np.float64)
+    total = hist.sum()
+    if total <= 0:
+        return 128
+    prob = hist / total
+    omega = np.cumsum(prob)
+    mu = np.cumsum(prob * np.arange(256))
+    mu_t = mu[-1]
+    denom = omega * (1.0 - omega)
+    denom[denom == 0] = np.nan
+    sigma_b = (mu_t * omega - mu) ** 2 / denom
+    return int(np.nanargmax(sigma_b))
+
+
+def _mask_bbox(mask: np.ndarray):
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _resize_gray(arr: np.ndarray, size):
+    if arr.size == 0:
+        return arr
+    return np.array(Image.fromarray(arr.astype(np.uint8), mode="L").resize(size, _NEAREST))
+
+
+def _template_match_score(crop: np.ndarray, tmpl: np.ndarray) -> float:
+    if crop.size == 0 or tmpl.size == 0:
+        return -1.0
+    if crop.shape != tmpl.shape:
+        crop = _resize_gray(crop, (tmpl.shape[1], tmpl.shape[0]))
+    crop_bin = crop < 128
+    tmpl_bin = tmpl < 128
+    return float(np.mean(crop_bin == tmpl_bin))
 
 
 def _binarize_cell(cell: np.ndarray, bg_val: float) -> np.ndarray:
@@ -104,12 +142,13 @@ def _dibits_to_bytes(dibits):
 
 
 def _candidate_data_lengths(total_bytes):
-    # Payload is roughly 70% of total bytes because ECC ratio is ~30%.
-    # Try larger payloads first.
+    # Try larger payloads first. ECC is adaptive, so we use the base rule
+    # from the encoder and test candidate payload lengths against it.
     max_data = max(1, total_bytes - 4)
     for n_data in range(max_data, 0, -1):
         nsym = total_bytes - n_data
-        min_nsym = max(4, math.ceil(n_data * ECC_RATIO / (1 - ECC_RATIO)))
+        ecc_ratio = ecc_ratio_for_data(n_data, signed=False)
+        min_nsym = max(4, math.ceil(n_data * ecc_ratio / (1 - ecc_ratio)))
         if nsym >= min_nsym:
             yield n_data, nsym
 
@@ -202,30 +241,52 @@ def _prepare_photo_image(img: Image.Image):
         candidates.append((score, ang, crop, box))
     if not candidates:
         return img, 0
-
-    if _legacy is not None:
-        best = None
-        for score, ang, crop, box in candidates:
-            try:
-                anchors = _legacy._scan_anchors(crop)
-                count = len(anchors)
-                area = crop.size[0] * crop.size[1]
-                if best is None or count > best[0] or (count == best[0] and area < best[1]) or (
-                    count == best[0] and area == best[1] and score > best[2]
-                ):
-                    best = (count, area, score, ang, crop, box)
-            except Exception:
-                continue
-        if best is not None and best[0] > 0:
-            _, _, _, ang, crop, _ = best
-            return crop, ang
-
     score, ang, crop, _ = max(candidates, key=lambda item: item[0])
     return crop, ang
 
 
+def _photo_canvas_crop(img: Image.Image):
+    """Find a large square-ish bright canvas inside a photo crop."""
+    if min(img.size) < 240:
+        return img
+
+    scale = max(4, min(8, max(1, min(img.size) // 300)))
+    small = img.convert("L").resize((max(1, img.width // scale), max(1, img.height // scale)))
+    arr = np.array(small)
+
+    best = None
+    for thr in (220, 230, 235, 240, 245):
+        mask = arr >= thr
+        for area, x0, y0, x1, y1 in _component_bboxes(mask, top_n=12):
+            bw = x1 - x0 + 1
+            bh = y1 - y0 + 1
+            if bw < 20 or bh < 20:
+                continue
+            ratio = bw / max(bh, 1)
+            if not (0.75 <= ratio <= 1.35):
+                continue
+            if x0 <= 1 or y0 <= 1 or x1 >= arr.shape[1] - 2 or y1 >= arr.shape[0] - 2:
+                continue
+            score = area / (1.0 + abs(1.0 - ratio) * 20.0)
+            if best is None or score > best[0]:
+                best = (score, x0, y0, x1, y1)
+
+    if best is None:
+        return img
+
+    _, x0, y0, x1, y1 = best
+    pad = 2
+    box = (
+        max(0, (x0 - pad) * scale),
+        max(0, (y0 - pad) * scale),
+        min(img.width, (x1 + pad + 1) * scale),
+        min(img.height, (y1 + pad + 1) * scale),
+    )
+    return img.crop(box)
+
+
 def _decode_once(img: Image.Image, templates, thresh, photo_mode, verify_pw=None):
-    from triqr_detect import detect, _warp_gray
+    from tricode_detect import detect, _warp_gray
 
     anchors, angle, rect, enh, binary = detect(img, templates, thresh=thresh, photo_mode=photo_mode)
     rot_gray = np.array(_warp_gray(np.array(img.convert("L")), angle)) if angle else np.array(img.convert("L"))
@@ -266,20 +327,204 @@ def _decode_raw_from_anchor(arr, side, cpx_f, r_start, c_start, corner):
     return _dibits_to_bytes(dibits), confs
 
 
+def _decode_upright_pure_python(img: Image.Image, verify_pw=None):
+    """Decode a clean upright Tricode image without cv2."""
+    arr = np.array(img.convert("L"))
+    thr = _otsu_threshold(arr)
+    mask = arr <= thr
+    h, w = mask.shape
+    bbox_candidates = []
+    bbox = _mask_bbox(mask)
+    if bbox is not None:
+        bbox_candidates.append(bbox)
+        x0, y0, x1, y1 = bbox
+        if x0 <= 1 or y0 <= 1 or x1 >= w - 2 or y1 >= h - 2 or (x1 - x0 + 1) > int(w * 0.9) or (y1 - y0 + 1) > int(h * 0.9):
+            for trim in (0.03, 0.05, 0.08, 0.12):
+                x0t = int(w * trim)
+                y0t = int(h * trim)
+                x1t = int(w * (1.0 - trim))
+                y1t = int(h * (1.0 - trim))
+                if x1t <= x0t or y1t <= y0t:
+                    continue
+                sub = mask[y0t:y1t, x0t:x1t]
+                bb = _mask_bbox(sub)
+                if bb is not None:
+                    bbox_candidates.append((bb[0] + x0t, bb[1] + y0t, bb[2] + x0t, bb[3] + y0t))
+    if not bbox_candidates:
+        raise ValueError("TriQR 영역을 찾지 못했습니다")
+
+    def _bbox_score(box):
+        bx0, by0, bx1, by1 = box
+        bw = bx1 - bx0 + 1
+        bh = by1 - by0 + 1
+        ratio = bw / max(bh, 1)
+        edge_penalty = 0
+        if bx0 <= 1:
+            edge_penalty += 1
+        if by0 <= 1:
+            edge_penalty += 1
+        if bx1 >= w - 2:
+            edge_penalty += 1
+        if by1 >= h - 2:
+            edge_penalty += 1
+        return (edge_penalty, -bw * bh / (1.0 + abs(1.0 - ratio) * 10.0), bw * bh)
+
+    x0, y0, x1, y1 = sorted(bbox_candidates, key=_bbox_score)[0]
+    bw = x1 - x0 + 1
+    bh = y1 - y0 + 1
+    if bw < 40 or bh < 40:
+        raise ValueError("TriQR 영역이 너무 작습니다")
+
+    best = None
+    for side in range(6, 41):
+        cpx = max(1, round(min(bw, bh) / side))
+        if cpx < 4:
+            continue
+        if abs(side * cpx - bw) > max(3, cpx):
+            continue
+        if abs(side * cpx - bh) > max(3, cpx):
+            continue
+
+        a_px = ANCHOR_SIZE * cpx
+        if x0 + a_px > arr.shape[1] or y0 + a_px > arr.shape[0]:
+            continue
+
+        score = 0.0
+        ok = True
+        for corner in ("TL", "TR", "BL", "BR"):
+            if corner == "TL":
+                cx0, cy0 = x0, y0
+            elif corner == "TR":
+                cx0, cy0 = x1 - a_px + 1, y0
+            elif corner == "BL":
+                cx0, cy0 = x0, y1 - a_px + 1
+            else:
+                cx0, cy0 = x1 - a_px + 1, y1 - a_px + 1
+
+            if cx0 < 0 or cy0 < 0 or cx0 + a_px > arr.shape[1] or cy0 + a_px > arr.shape[0]:
+                ok = False
+                break
+
+            crop = arr[cy0 : cy0 + a_px, cx0 : cx0 + a_px]
+            tmpl = render_anchor(corner, cpx, 0)
+            score += _template_match_score(crop, tmpl)
+
+        if not ok:
+            continue
+
+        avg = score / 4.0
+        if best is None or avg > best[0]:
+            best = (avg, side, cpx, x0, y0)
+
+    if best is None:
+        raise ValueError("TriQR 앵커를 판독하지 못했습니다")
+
+    _, side, cpx, x0, y0 = best
+
+    best_parsed = None
+    best_meta = None
+    best_score = float("-inf")
+
+    side_lo = max(6, side - 2)
+    side_hi = side + 2
+    cpx_lo = max(1, cpx - 2)
+    cpx_hi = cpx + 2
+
+    for side_try in range(side_lo, side_hi + 1):
+        for cpx_try in range(cpx_lo, cpx_hi + 1):
+            a_px = ANCHOR_SIZE * cpx_try
+            side_px = side_try * cpx_try
+            corners = {
+                "TL": (x0, y0),
+                "TR": (x0 + side_px - a_px, y0),
+                "BL": (x0, y0 + side_px - a_px),
+                "BR": (x0 + side_px - a_px, y0 + side_px - a_px),
+            }
+            if corners["TR"][0] < 0 or corners["BL"][1] < 0:
+                continue
+            if corners["BR"][0] + a_px > arr.shape[1] or corners["BR"][1] + a_px > arr.shape[0]:
+                continue
+
+            anchors = []
+            for corner, (cx0, cy0) in corners.items():
+                anchors.append(
+                    {
+                        "corner": corner,
+                        "r": int(cy0),
+                        "c": int(cx0),
+                        "w": a_px,
+                        "h": a_px,
+                        "cpx": cpx_try,
+                        "score": 1.0,
+                        "n90": 0,
+                        "cx": float(cx0 + a_px / 2.0),
+                        "cy": float(cy0 + a_px / 2.0),
+                    }
+                )
+
+            rect = {
+                "quality": "pure-python",
+                "angle": 0.0,
+                "side": side_try,
+                "cpx": cpx_try,
+                "anchors_used": ["TL", "TR", "BL", "BR"],
+                "corners": {k: (float(v[0]), float(v[1])) for k, v in corners.items()},
+            }
+
+            try:
+                enc, confs = _decode_raw_from_anchor(arr, side_try, cpx_try, y0, x0, "TL")
+                parsed = _try_parse_encoded(enc, confs, verify_pw=verify_pw)
+            except Exception:
+                continue
+
+            score = _score_parsed_result(parsed)
+            if _is_plausible_text(parsed):
+                parsed["angle"] = 0.0
+                parsed["side"] = side_try
+                parsed["cpx"] = cpx_try
+                parsed["anchor"] = "TL"
+                parsed["anchors"] = anchors
+                parsed["rect"] = rect
+                enh = arr.copy()
+                binary = (mask.astype(np.uint8) * 255)
+                return parsed, anchors, 0.0, rect, enh, binary
+            if score > best_score:
+                best_score = score
+                best_parsed = parsed
+                best_meta = (anchors, rect, side_try, cpx_try)
+
+    if best_parsed is None or best_meta is None:
+        raise ValueError("payload decode 실패")
+
+    anchors, rect, side_try, cpx_try = best_meta
+    best_parsed["angle"] = 0.0
+    best_parsed["side"] = side_try
+    best_parsed["cpx"] = cpx_try
+    best_parsed["anchor"] = "TL"
+    best_parsed["anchors"] = anchors
+    best_parsed["rect"] = rect
+    enh = arr.copy()
+    binary = (mask.astype(np.uint8) * 255)
+    return best_parsed, anchors, 0.0, rect, enh, binary
+
+
 def _try_parse_encoded(enc, confidences, verify_pw=None):
     total_bytes = len(enc)
     era = [bi for bi in range(total_bytes) if bi * 4 < len(confidences) and min(confidences[bi * 4 : bi * 4 + 4]) <= CONF_THRESH]
+    inv_perm = codeword_permutation_inverse(total_bytes)
+    shuffled = codeword_unpermute(enc)
+    era_shuffled = [inv_perm[pos] for pos in era]
 
     for n_data, nsym in _candidate_data_lengths(total_bytes):
         try:
             decoded = None
-            if era and len(era) <= nsym:
+            if era_shuffled and len(era_shuffled) <= nsym:
                 try:
-                    decoded = rs_decode_erasure(enc, nsym, era)
+                    decoded = rs_decode_erasure(shuffled, nsym, era_shuffled)
                 except Exception:
                     decoded = None
             if decoded is None:
-                decoded = rs_decode(enc, nsym)
+                decoded = rs_decode(shuffled, nsym)
             return parse_payload(decoded, verify_pw=verify_pw)
         except Exception:
             continue
@@ -365,6 +610,20 @@ def decode_image(img: Image.Image, templates=None, thresh=0.55, photo_mode=False
     if templates is None:
         templates = load_templates()
 
+    if not _CV2:
+        if photo_mode or max(img.size) >= 1600:
+            try:
+                prepared, ang = _prepare_photo_image(img)
+                if abs(ang) > 0.5:
+                    prepared = prepared.rotate(-ang, expand=True, fillcolor=(255, 255, 255))
+                canvas = _photo_canvas_crop(prepared)
+                if canvas.size != prepared.size:
+                    return _decode_upright_pure_python(canvas, verify_pw=verify_pw)
+                return _decode_upright_pure_python(prepared, verify_pw=verify_pw)
+            except Exception:
+                pass
+        return _decode_upright_pure_python(img, verify_pw=verify_pw)
+
     orig_img = img
     candidates = []
     seen = set()
@@ -401,52 +660,7 @@ def decode_image(img: Image.Image, templates=None, thresh=0.55, photo_mode=False
                         candidate_img, templates, thresh, candidate_photo_mode, verify_pw=verify_pw
                     )
                 else:
-                    if _legacy is None:
-                        raise RuntimeError("cv2 또는 triqr_v2가 필요합니다")
-
-                    raw_anchors = _legacy._scan_anchors(candidate_img)
-                    if raw_anchors:
-                        detected_rot = raw_anchors[0].get("_rotation", 0)
-                        if detected_rot != 0:
-                            candidate_img = candidate_img.rotate(-detected_rot, expand=True, fillcolor=(255, 255, 255))
-                            raw_anchors = _legacy._scan_anchors(candidate_img)
-                    iw, ih = candidate_img.size
-                    angle = _legacy._estimate_rotation_continuous(raw_anchors, iw, ih) if raw_anchors else 0.0
-                    rotated = _legacy._rotate_image_arbitrary(candidate_img, angle) if abs(angle) > 0.5 else candidate_img
-                    rot_gray = np.array(rotated.convert("L"))
-                    legacy_anchors = _legacy._scan_anchors(rotated) if raw_anchors else []
-                    anchors = []
-                    for a in legacy_anchors:
-                        aa = dict(a)
-                        if "cpx" not in aa:
-                            aa["cpx"] = max(1, round(aa.get("cpx_f", 1)))
-                        anchors.append(aa)
-                    if anchors:
-                        pr = _legacy._params_from_anchors(anchors, *rotated.size)
-                        if pr:
-                            rect = {
-                                "side": pr[0],
-                                "cpx": pr[1],
-                                "mc": pr[2],
-                                "angle": angle,
-                                "quality": f"{len(anchors)}-corner",
-                                "anchors_used": [a["corner"] for a in anchors],
-                                "corners": {a["corner"]: (a["cx"], a["cy"]) for a in anchors},
-                            }
-                        else:
-                            rect = None
-                    else:
-                        rect = None
-                    enh = rot_gray.copy()
-                    binary = (rot_gray < 128).astype(np.uint8) * 255
-
-                    parsed, used_anchor, side, cpx = _decode_with_anchor(rot_gray, anchors, rect, verify_pw=verify_pw)
-                    parsed["angle"] = angle
-                    parsed["side"] = side
-                    parsed["cpx"] = cpx
-                    parsed["anchor"] = used_anchor["corner"]
-                    parsed["anchors"] = anchors
-                    parsed["rect"] = rect
+                    raise RuntimeError("cv2가 필요합니다")
                 score = _score_parsed_result(parsed)
                 if _is_plausible_text(parsed):
                     return parsed, anchors, angle, rect, enh, binary
