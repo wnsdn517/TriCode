@@ -11,8 +11,8 @@ from collections import deque
 import numpy as np
 from PIL import Image, ImageOps
 
-from tricode_rs import rs_decode, rs_decode_erasure
-from tricode_common import ANCHOR_BUF, ANCHOR_SIZE, CELL_PX, HERE, MARGIN, TRI_DL, TRI_DR, TRI_UL, TRI_UR, codeword_permutation_inverse, codeword_unpermute, ecc_ratio_for_data
+from tricode_rs import rs_decode, rs_decode_erasure, rs_decode_multiblock, rs_decode_erasure_multiblock
+from tricode_common import ANCHOR_BUF, ANCHOR_SIZE, CELL_PX, HERE, MARGIN, TRI_DL, TRI_DR, TRI_UL, TRI_UR, ecc_ratio_for_data
 from tricode_payload import parse_payload
 from tricode_render import load_templates, render_anchor
 
@@ -142,18 +142,38 @@ def _dibits_to_bytes(dibits):
 
 
 def _candidate_data_lengths(total_bytes):
-    # Try larger payloads first. ECC is adaptive, so we use the base rule
-    # from the encoder and test candidate payload lengths against it.
+    # 서명 여부(signed)에 따라 ECC 비율이 달라지므로 둘 다 시도하고 중복 제거.
     max_data = max(1, total_bytes - 4)
-    for n_data in range(max_data, 0, -1):
-        nsym = total_bytes - n_data
-        ecc_ratio = ecc_ratio_for_data(n_data, signed=False)
-        min_nsym = max(4, math.ceil(n_data * ecc_ratio / (1 - ecc_ratio)))
-        if nsym >= min_nsym:
-            yield n_data, nsym
+    seen: set = set()
+    for signed in (False, True):
+        for n_data in range(max_data, 0, -1):
+            nsym = total_bytes - n_data
+            ecc_ratio = ecc_ratio_for_data(n_data, signed=signed)
+            min_nsym = max(4, math.ceil(n_data * ecc_ratio / (1 - ecc_ratio)))
+            if nsym >= min_nsym:
+                key = (n_data, nsym)
+                if key not in seen:
+                    seen.add(key)
+                    yield n_data, nsym
 
 
 def _component_bboxes(mask: np.ndarray, top_n: int = 6):
+    # cv2가 있으면 C 구현으로 훨씬 빠르게 처리
+    if _CV2:
+        n_labels, _, stats, _ = cv2.connectedComponentsWithStats(
+            mask.astype(np.uint8) * 255, connectivity=4
+        )
+        comps = []
+        for label in range(1, n_labels):
+            x = int(stats[label, cv2.CC_STAT_LEFT])
+            y = int(stats[label, cv2.CC_STAT_TOP])
+            w = int(stats[label, cv2.CC_STAT_WIDTH])
+            h = int(stats[label, cv2.CC_STAT_HEIGHT])
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            comps.append((area, x, y, x + w - 1, y + h - 1))
+        comps.sort(reverse=True)
+        return comps[:top_n]
+    # fallback: pure-Python BFS
     h, w = mask.shape
     seen = np.zeros_like(mask, dtype=bool)
     comps = []
@@ -169,14 +189,10 @@ def _component_bboxes(mask: np.ndarray, top_n: int = 6):
             while q:
                 cy, cx = q.popleft()
                 cnt += 1
-                if cx < minx:
-                    minx = cx
-                if cx > maxx:
-                    maxx = cx
-                if cy < miny:
-                    miny = cy
-                if cy > maxy:
-                    maxy = cy
+                if cx < minx: minx = cx
+                if cx > maxx: maxx = cx
+                if cy < miny: miny = cy
+                if cy > maxy: maxy = cy
                 for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
                     if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
                         seen[ny, nx] = True
@@ -300,7 +316,8 @@ def _decode_once(img: Image.Image, templates, thresh, photo_mode, verify_pw=None
     return parsed, anchors, angle, rect, enh, binary
 
 
-def _decode_raw_from_anchor(arr, side, cpx_f, r_start, c_start, corner):
+def _decode_raw_from_anchor(arr, side, cpx_f, r_anchor_center, c_anchor_center, corner):
+    """Decode cells using anchor CENTER coordinates for accurate grid alignment."""
     ah, aw = arr.shape[:2]
     cpx = max(1, round(cpx_f))
     masks = _get_masks(cpx)
@@ -312,11 +329,15 @@ def _decode_raw_from_anchor(arr, side, cpx_f, r_start, c_start, corner):
         "BR": (side - ANCHOR_SIZE, side - ANCHOR_SIZE),
     }
     r_ref, c_ref = REF[corner]
+    # Anchor bounding box center = (r_ref + ANCHOR_SIZE/2, c_ref + ANCHOR_SIZE/2) in cell units from grid origin.
+    # Solve for grid origin:
+    grid_origin_r = r_anchor_center - (r_ref + ANCHOR_SIZE / 2) * cpx_f
+    grid_origin_c = c_anchor_center - (c_ref + ANCHOR_SIZE / 2) * cpx_f
     dibits = []
     confs = []
     for (r, c) in _data_pos(side):
-        r0 = round(r_start + (r - r_ref) * cpx_f)
-        c0 = round(c_start + (c - c_ref) * cpx_f)
+        r0 = round(grid_origin_r + r * cpx_f)
+        c0 = round(grid_origin_c + c * cpx_f)
         if r0 < 0 or r0 + cpx > ah or c0 < 0 or c0 + cpx > aw:
             dibits.append(0)
             confs.append(0)
@@ -472,7 +493,10 @@ def _decode_upright_pure_python(img: Image.Image, verify_pw=None):
             }
 
             try:
-                enc, confs = _decode_raw_from_anchor(arr, side_try, cpx_try, y0, x0, "TL")
+                a_px = ANCHOR_SIZE * cpx_try
+                # Pass TL anchor CENTER (x0, y0 are top-left; center = top-left + half anchor)
+                enc, confs = _decode_raw_from_anchor(arr, side_try, cpx_try,
+                                                     y0 + a_px / 2, x0 + a_px / 2, "TL")
                 parsed = _try_parse_encoded(enc, confs, verify_pw=verify_pw)
             except Exception:
                 continue
@@ -511,20 +535,17 @@ def _decode_upright_pure_python(img: Image.Image, verify_pw=None):
 def _try_parse_encoded(enc, confidences, verify_pw=None):
     total_bytes = len(enc)
     era = [bi for bi in range(total_bytes) if bi * 4 < len(confidences) and min(confidences[bi * 4 : bi * 4 + 4]) <= CONF_THRESH]
-    inv_perm = codeword_permutation_inverse(total_bytes)
-    shuffled = codeword_unpermute(enc)
-    era_shuffled = [inv_perm[pos] for pos in era]
 
     for n_data, nsym in _candidate_data_lengths(total_bytes):
         try:
             decoded = None
-            if era_shuffled and len(era_shuffled) <= nsym:
+            if era and len(era) <= nsym:
                 try:
-                    decoded = rs_decode_erasure(shuffled, nsym, era_shuffled)
+                    decoded = rs_decode_erasure_multiblock(enc, n_data, nsym, era)
                 except Exception:
                     decoded = None
             if decoded is None:
-                decoded = rs_decode(shuffled, nsym)
+                decoded = rs_decode_multiblock(enc, n_data, nsym)
             return parse_payload(decoded, verify_pw=verify_pw)
         except Exception:
             continue
@@ -551,52 +572,97 @@ def _score_parsed_result(parsed) -> float:
 
 def _is_plausible_text(parsed) -> bool:
     text = str(parsed.get("text", ""))
-    if len(text) < 4:
+    if len(text) < 2:
+        return False
+    # 출력 불가능한 제어 문자(탭/줄바꿈 제외)가 있으면 거짓
+    if any(ord(ch) < 32 and ch not in "\n\r\t" for ch in text):
         return False
     printable = sum(32 <= ord(ch) <= 126 or ch in "\n\r\t" for ch in text)
-    if printable / len(text) < 0.95:
-        return False
-    letters = sum(ch.isalpha() for ch in text)
-    return letters / len(text) >= 0.7
+    return printable / len(text) >= 0.90
+
+
+def _geo_cpx(rect, side):
+    """Estimate cell pixel size from rect anchor-center positions."""
+    corners = rect.get("corners", {})
+    n_cells = max(1, side - ANCHOR_SIZE)
+    spans = []
+    if "TL" in corners and "TR" in corners:
+        dx = corners["TR"][0] - corners["TL"][0]
+        dy = corners["TR"][1] - corners["TL"][1]
+        spans.append(math.hypot(dx, dy) / n_cells)
+    if "TL" in corners and "BL" in corners:
+        dx = corners["BL"][0] - corners["TL"][0]
+        dy = corners["BL"][1] - corners["TL"][1]
+        spans.append(math.hypot(dx, dy) / n_cells)
+    if not spans:
+        return None
+    return sum(spans) / len(spans)
 
 
 def _decode_with_anchor(rot_gray, anchors, rect, verify_pw=None):
     if not anchors or rect is None:
         raise ValueError("앵커 정보 부족")
 
-    # Try anchors in descending confidence order.
+    # Compute inter-anchor span for geometry-derived side estimates
+    corners = rect.get("corners", {}) if rect else {}
+    _spans = []
+    if "TL" in corners and "TR" in corners:
+        _spans.append(math.hypot(corners["TR"][0] - corners["TL"][0], corners["TR"][1] - corners["TL"][1]))
+    if "TL" in corners and "BL" in corners:
+        _spans.append(math.hypot(corners["BL"][0] - corners["TL"][0], corners["BL"][1] - corners["TL"][1]))
+    _span = sum(_spans) / len(_spans) if _spans else 0
+
     for anchor in sorted(anchors, key=lambda a: -a.get("score", 0.0)):
+        min_side = ANCHOR_SIZE * 2 + ANCHOR_BUF * 2 + 2
         side_candidates = []
+
+        # From rect["side"] ± narrow range (fast path for aligned templates)
         if rect.get("side"):
             for delta in range(-3, 4):
                 s = rect["side"] + delta
-                if s >= (ANCHOR_SIZE * 2 + ANCHOR_BUF * 2 + 2):
+                if s >= min_side:
                     side_candidates.append(s)
-        if anchor.get("cpx"):
-            est = max(1, round(anchor["cpx"]))
-            for delta in range(-2, 3):
-                s = rect["side"] + delta if rect.get("side") else max(6, round(min(rot_gray.shape) / est) + delta)
-                if s >= (ANCHOR_SIZE * 2 + ANCHOR_BUF * 2 + 2):
+
+        # Span-based side estimates: sweep cpx hypotheses around anchor["cpx"]
+        # This covers the case where cpx_template ≠ cpx_actual
+        if _span > 0 and anchor.get("cpx"):
+            base = int(anchor["cpx"])
+            for cpx_hyp in range(max(4, base - 8), min(40, base + 9)):
+                s = round(_span / cpx_hyp + ANCHOR_SIZE)
+                if s >= min_side:
                     side_candidates.append(s)
+
         side_candidates = list(dict.fromkeys(side_candidates))
-        cpx_candidates = []
-        base_cpx = float(anchor.get("cpx", 0))
-        for delta in (-1, 0, 1):
-            c = max(1, round(base_cpx + delta)) if base_cpx else None
-            if c and c not in cpx_candidates:
-                cpx_candidates.append(c)
-        if not cpx_candidates and rect.get("cpx"):
-            cpx_candidates.append(max(1, round(rect["cpx"])))
 
         for side in side_candidates:
+            cpx_candidates = []
+
+            # Geometry-derived cpx (most accurate — independent of template size)
+            geo = _geo_cpx(rect, side)
+            if geo and geo > 0:
+                for delta in (-1, 0, 1):
+                    c = max(1, round(geo + delta))
+                    if c not in cpx_candidates:
+                        cpx_candidates.append(c)
+
+            # Template-size cpx as fallback
+            base_cpx = float(anchor.get("cpx", 0))
+            for delta in (-1, 0, 1):
+                c = max(1, round(base_cpx + delta)) if base_cpx else None
+                if c and c not in cpx_candidates:
+                    cpx_candidates.append(c)
+
+            if not cpx_candidates and rect.get("cpx"):
+                cpx_candidates.append(max(1, round(rect["cpx"])))
+
             for cpx in cpx_candidates:
                 try:
                     enc, confs = _decode_raw_from_anchor(
                         rot_gray,
                         side,
                         cpx,
-                        anchor["r"],
-                        anchor["c"],
+                        anchor["cy"],   # anchor CENTER row (not template top-left)
+                        anchor["cx"],   # anchor CENTER col
                         anchor["corner"],
                     )
                     return _try_parse_encoded(enc, confs, verify_pw=verify_pw), anchor, side, cpx

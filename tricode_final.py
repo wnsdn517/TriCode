@@ -32,8 +32,11 @@ def main():
 
     # ── enroll ──
     if cmd=='enroll':
-        if len(args)<2: print("enroll <name> <password>"); return
-        cmd_enroll(args[0],args[1])
+        if len(args)<1: print("enroll <name>"); return
+        pw = getpass.getpass(f"'{args[0]}' 비밀번호 설정: ")
+        if not pw:
+            print("비밀번호를 입력하세요."); return
+        cmd_enroll(args[0], pw)
 
     # ── encode ──
     elif cmd=='encode':

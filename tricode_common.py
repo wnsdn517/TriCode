@@ -21,26 +21,34 @@ TRI_DL = 0b11
 CELL_EMPTY = 0b100
 CELL_FULL = 0b101
 
+
+# 각 모서리 패턴과 그 90°/180°/270° 회전이 서로 구별되도록 설계한 비대칭 L자 패턴.
+# 검증 완료: 4코너 × 4회전 = 16가지 패턴이 모두 서로 다름.
+#
+# TL: [F F DR / F E E / F E E]  - 왼쪽+상단 L, DR 삼각형 상단-우
+# TR: [DL F F / E E F / E E F]  - 오른쪽+상단 L, DL 삼각형 상단-좌
+# BL: [F E E / F E E / F F DR]  - 왼쪽+하단 L, DR 삼각형 하단-우
+# BR: [E E F / E E F / DR F F]  - 오른쪽+하단 L, DR 삼각형 하단-좌
 ANCHOR_PATTERNS = {
     "TL": [
-        [CELL_FULL, CELL_FULL, CELL_FULL],
-        [CELL_FULL, CELL_EMPTY, TRI_DR],
-        [CELL_FULL, TRI_UL, CELL_FULL],
+        [CELL_FULL, CELL_FULL, TRI_DR],
+        [CELL_FULL, CELL_EMPTY, CELL_EMPTY],
+        [CELL_FULL, CELL_EMPTY, CELL_EMPTY],
     ],
     "TR": [
-        [CELL_FULL, CELL_FULL, CELL_FULL],
-        [TRI_DL, CELL_EMPTY, CELL_FULL],
-        [CELL_FULL, TRI_UR, CELL_FULL],
+        [TRI_DL, CELL_FULL, CELL_FULL],
+        [CELL_EMPTY, CELL_EMPTY, CELL_FULL],
+        [CELL_EMPTY, CELL_EMPTY, CELL_FULL],
     ],
     "BL": [
-        [CELL_FULL, TRI_DL, CELL_FULL],
-        [CELL_FULL, CELL_EMPTY, TRI_UR],
-        [CELL_FULL, CELL_FULL, CELL_FULL],
+        [CELL_FULL, CELL_EMPTY, CELL_EMPTY],
+        [CELL_FULL, CELL_EMPTY, CELL_EMPTY],
+        [CELL_FULL, CELL_FULL, TRI_DR],
     ],
     "BR": [
-        [CELL_FULL, TRI_DR, CELL_FULL],
-        [TRI_UL, CELL_EMPTY, CELL_FULL],
-        [CELL_FULL, CELL_FULL, CELL_FULL],
+        [CELL_EMPTY, CELL_EMPTY, CELL_FULL],
+        [CELL_EMPTY, CELL_EMPTY, CELL_FULL],
+        [TRI_DR, CELL_FULL, CELL_FULL],
     ],
 }
 
@@ -132,6 +140,20 @@ def codeword_permutation_inverse(n: int):
     for i, p in enumerate(perm):
         inv[p] = i
     return inv
+
+
+def rs_block_plan(nd: int, nsym: int) -> list:
+    """총 (nd+nsym) > 255 일 때 다중 RS 블록 구조를 반환. [(data_bytes, ecc_bytes), ...]"""
+    total = nd + nsym
+    if total <= 255:
+        return [(nd, nsym)]
+    n_blocks = math.ceil(total / 255)
+    base_d, rem_d = divmod(nd, n_blocks)
+    base_e, rem_e = divmod(nsym, n_blocks)
+    return [
+        (base_d + (1 if i < rem_d else 0), base_e + (1 if i < rem_e else 0))
+        for i in range(n_blocks)
+    ]
 
 
 def ecc_ratio_for_data(n_data: int, signed: bool = False) -> float:

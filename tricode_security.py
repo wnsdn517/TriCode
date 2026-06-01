@@ -9,9 +9,8 @@ import secrets
 
 try:
     from cryptography.fernet import Fernet
-
     _FERNET = True
-except ImportError:
+except BaseException:
     _FERNET = False
 
 from tricode_common import KEYS_DIR, SERVER_DB, SIG_LEN
@@ -38,6 +37,12 @@ def _pw_to_fernet_key(password: str, salt: bytes) -> bytes:
     return base64.urlsafe_b64encode(raw)
 
 
+def _derive_keys(password: str, salt: bytes) -> tuple[bytes, bytes]:
+    """enc_key(32B) + mac_key(32B) 를 한 번의 PBKDF2로 유도."""
+    km = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000, 64)
+    return km[:32], km[32:]
+
+
 def _save_key(name: str, master_key: bytes, password: str):
     os.makedirs(KEYS_DIR, exist_ok=True)
     salt = secrets.token_bytes(16)
@@ -46,9 +51,11 @@ def _save_key(name: str, master_key: bytes, password: str):
         token = Fernet(fk).encrypt(master_key)
         open(_key_path(name), "wb").write(salt + token)
     else:
-        ks = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000, len(master_key))
-        ct = bytes(a ^ b for a, b in zip(master_key, ks))
-        open(_key_path(name), "wb").write(salt + ct)
+        enc_key, mac_key = _derive_keys(password, salt)
+        ct = bytes(a ^ b for a, b in zip(master_key, enc_key))
+        # HMAC-SHA256 으로 암호문 무결성 보호 (Encrypt-then-MAC)
+        tag = hmac.new(mac_key, ct, hashlib.sha256).digest()
+        open(_key_path(name), "wb").write(salt + ct + tag)
 
 
 def _load_key(name: str, password: str) -> bytes:
@@ -56,13 +63,18 @@ def _load_key(name: str, password: str) -> bytes:
     if not os.path.exists(pp):
         raise FileNotFoundError(f"키 파일 없음: {pp}")
     raw = open(pp, "rb").read()
-    salt, payload = raw[:16], raw[16:]
+    salt = raw[:16]
     if _FERNET:
-        fk = _pw_to_fernet_key(password, salt)
-        return Fernet(fk).decrypt(payload)
-    key_len = 32
-    ks = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000, key_len)
-    return bytes(a ^ b for a, b in zip(payload, ks))
+        return Fernet(_pw_to_fernet_key(password, salt)).decrypt(raw[16:])
+    # fallback: salt(16) + ct(32) + tag(32) = 80 bytes
+    if len(raw) < 80:
+        raise ValueError("키 파일이 손상되었습니다 (너무 짧음). 재등록 필요.")
+    ct, tag = raw[16:48], raw[48:80]
+    enc_key, mac_key = _derive_keys(password, salt)
+    expected_tag = hmac.new(mac_key, ct, hashlib.sha256).digest()
+    if not hmac.compare_digest(expected_tag, tag):
+        raise ValueError("키 파일 인증 실패 — 비밀번호 오류 또는 파일 변조.")
+    return bytes(a ^ b for a, b in zip(ct, enc_key))
 
 
 def cmd_enroll(name: str, password: str):

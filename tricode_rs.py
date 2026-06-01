@@ -101,28 +101,21 @@ def rs_decode(data:bytes, nsym:int)->bytes:
     return bytes(msg[:-nsym])
 
 def rs_decode_erasure(data: bytes, nsym: int, era_pos: list) -> bytes:
-    """
-    Erasure-only 복구 (위치를 알고 있는 경우).
-    최대 nsym개 erasure 복구 가능 (일반 오류의 2배).
-    """
+    """Erasure-only 복구. 최대 nsym개 erasure 복구 가능 (일반 오류의 2배)."""
     msg = list(data)
     n = len(msg)
     S = _syndromes(msg, nsym)
     if max(S) == 0:
         return bytes(msg[:-nsym])
-    # erasure locator sigma
     sigma = [1]
     for k in era_pos:
         sigma = pm(sigma, [1, gp(2, n-1-k)])
-    # omega = S * sigma mod x^nsym
     omega_raw = [0]*(nsym + len(sigma))
     for i, s in enumerate(S):
         for j, sg in enumerate(sigma):
             if i+j < len(omega_raw): omega_raw[i+j] ^= gm(s, sg)
     omega = omega_raw[:nsym]
-    # formal derivative of sigma
     sig_d = [sigma[k] if k%2==1 else 0 for k in range(1, len(sigma))]
-    # Forney magnitudes
     for k in era_pos:
         Xk = gp(2, n-1-k); Xk_inv = gi(Xk)
         om = pe(omega[::-1], Xk_inv)
@@ -132,3 +125,112 @@ def rs_decode_erasure(data: bytes, nsym: int, era_pos: list) -> bytes:
     if max(_syndromes(msg, nsym)) != 0:
         raise ReedSolomonError("Erasure 복구 실패 — 오류 초과")
     return bytes(msg[:-nsym])
+
+
+def rs_encode_multiblock(data: bytes, nsym: int) -> bytes:
+    """QR 스타일 다중 블록 RS 인코딩. 총 바이트가 255 초과 시 자동 분할 후 인터리빙."""
+    from tricode_common import rs_block_plan
+    plan = rs_block_plan(len(data), nsym)
+    if len(plan) == 1:
+        nd_b, nsym_b = plan[0]
+        return rs_encode(data, nsym_b)
+    data_parts, ecc_parts = [], []
+    offset = 0
+    for nd_b, nsym_b in plan:
+        encoded = rs_encode(data[offset:offset + nd_b], nsym_b)
+        data_parts.append(encoded[:nd_b])
+        ecc_parts.append(encoded[nd_b:])
+        offset += nd_b
+    result = bytearray()
+    for i in range(max(len(p) for p in data_parts)):
+        for p in data_parts:
+            if i < len(p):
+                result.append(p[i])
+    for i in range(max(len(p) for p in ecc_parts)):
+        for p in ecc_parts:
+            if i < len(p):
+                result.append(p[i])
+    return bytes(result)
+
+
+def rs_decode_multiblock(data: bytes, nd: int, nsym: int) -> bytes:
+    """다중 블록 RS 디코딩. 인터리빙 해제 후 각 블록 독립 복호."""
+    from tricode_common import rs_block_plan
+    plan = rs_block_plan(nd, nsym)
+    if len(plan) == 1:
+        nd_b, nsym_b = plan[0]
+        return rs_decode(data, nsym_b)
+    n_blocks = len(plan)
+    data_sizes = [nd_b for nd_b, _ in plan]
+    ecc_sizes = [nsym_b for _, nsym_b in plan]
+    data_blocks = [bytearray() for _ in range(n_blocks)]
+    ecc_blocks = [bytearray() for _ in range(n_blocks)]
+    idx = 0
+    for i in range(max(data_sizes)):
+        for bi in range(n_blocks):
+            if i < data_sizes[bi]:
+                data_blocks[bi].append(data[idx] if idx < len(data) else 0)
+                idx += 1
+    for i in range(max(ecc_sizes)):
+        for bi in range(n_blocks):
+            if i < ecc_sizes[bi]:
+                ecc_blocks[bi].append(data[idx] if idx < len(data) else 0)
+                idx += 1
+    result = bytearray()
+    for bi in range(n_blocks):
+        result.extend(rs_decode(bytes(data_blocks[bi]) + bytes(ecc_blocks[bi]), ecc_sizes[bi]))
+    return bytes(result)
+
+
+def rs_decode_erasure_multiblock(data: bytes, nd: int, nsym: int, era_interleaved: list) -> bytes:
+    """다중 블록 erasure 복호. 인터리빙 좌표계의 erasure 위치를 블록별로 매핑."""
+    from tricode_common import rs_block_plan
+    plan = rs_block_plan(nd, nsym)
+    if len(plan) == 1:
+        nd_b, nsym_b = plan[0]
+        return rs_decode_erasure(data, nsym_b, era_interleaved)
+    n_blocks = len(plan)
+    data_sizes = [nd_b for nd_b, _ in plan]
+    ecc_sizes = [nsym_b for _, nsym_b in plan]
+    pos_map: dict[int, tuple[int, int]] = {}
+    idx = 0
+    for i in range(max(data_sizes)):
+        for bi in range(n_blocks):
+            if i < data_sizes[bi]:
+                pos_map[idx] = (bi, i)
+                idx += 1
+    for i in range(max(ecc_sizes)):
+        for bi in range(n_blocks):
+            if i < ecc_sizes[bi]:
+                pos_map[idx] = (bi, data_sizes[bi] + i)
+                idx += 1
+    era_by_block: list[list[int]] = [[] for _ in range(n_blocks)]
+    for p in era_interleaved:
+        if p in pos_map:
+            bi, local_p = pos_map[p]
+            era_by_block[bi].append(local_p)
+    data_blocks = [bytearray() for _ in range(n_blocks)]
+    ecc_blocks = [bytearray() for _ in range(n_blocks)]
+    idx = 0
+    for i in range(max(data_sizes)):
+        for bi in range(n_blocks):
+            if i < data_sizes[bi]:
+                data_blocks[bi].append(data[idx] if idx < len(data) else 0)
+                idx += 1
+    for i in range(max(ecc_sizes)):
+        for bi in range(n_blocks):
+            if i < ecc_sizes[bi]:
+                ecc_blocks[bi].append(data[idx] if idx < len(data) else 0)
+                idx += 1
+    result = bytearray()
+    for bi in range(n_blocks):
+        block = bytes(data_blocks[bi]) + bytes(ecc_blocks[bi])
+        era = era_by_block[bi]
+        if era and len(era) <= ecc_sizes[bi]:
+            try:
+                result.extend(rs_decode_erasure(block, ecc_sizes[bi], era))
+                continue
+            except ReedSolomonError:
+                pass
+        result.extend(rs_decode(block, ecc_sizes[bi]))
+    return bytes(result)
