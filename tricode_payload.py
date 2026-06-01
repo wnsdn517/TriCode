@@ -3,8 +3,13 @@
 import struct
 import zlib
 
-from tricode_common import FLAG_SIG, FLAG_ZLIB, MODE_A7, MODE_AN, MODE_U8, SIG_LEN, _AI, _AN
-from tricode_security import _sign_hmac, _verify_hmac
+from tricode_common import (
+    FLAG_SIG, FLAG_SIG_ED25519, FLAG_ZLIB,
+    MODE_A7, MODE_AN, MODE_U8,
+    SIG_LEN, SIG_LEN_ED25519,
+    _AI, _AN,
+)
+from tricode_security import sign_data, verify_data
 
 
 def _sel(t):
@@ -56,10 +61,6 @@ def _decompress_body(body: bytes) -> bytes:
 
 
 def _pick_body(text_body: bytes):
-    """
-    Choose the smallest safe representation for the current payload.
-    Raw bytes win whenever compression does not pay for itself.
-    """
     best_kind = "raw"
     best_level = 0
     best_body = text_body
@@ -116,9 +117,13 @@ def build_payload(text, sign_name=None, sign_pw=None, return_meta=False):
         name_bytes = sign_name.encode("utf-8")
         if len(name_bytes) > 0xFF:
             raise ValueError("서명자 이름이 너무 깁니다 (최대 255바이트)")
-        sig = _sign_hmac(text_body, sign_name, sign_pw)
+        sig = sign_data(text_body, sign_name, sign_pw)
+        # Set the right flag based on sig length
+        if len(sig) == SIG_LEN_ED25519:
+            flag |= FLAG_SIG_ED25519
+        else:
+            flag |= FLAG_SIG
         tail = sig + name_bytes + struct.pack("B", len(name_bytes))
-        flag |= FLAG_SIG
         payload = struct.pack("B", flag) + body + tail
     else:
         payload = struct.pack("B", flag) + body
@@ -140,16 +145,24 @@ def parse_payload(raw, verify_pw=None):
         raise ValueError("빈 payload")
     flag = raw[0]
 
-    if flag & FLAG_SIG:
-        if len(raw) < SIG_LEN + 2:
+    # Determine signature length from flag
+    if flag & FLAG_SIG_ED25519:
+        sig_len = SIG_LEN_ED25519
+    elif flag & FLAG_SIG:
+        sig_len = SIG_LEN
+    else:
+        sig_len = 0
+
+    if sig_len > 0:
+        if len(raw) < sig_len + 2:
             raise ValueError("서명 payload가 너무 짧습니다")
         sl = raw[-1]
         tail_start = len(raw) - 1 - sl
-        if tail_start < 1 + SIG_LEN:
+        if tail_start < 1 + sig_len:
             raise ValueError("서명 payload 길이가 맞지 않습니다")
         signer = raw[tail_start:-1].decode("utf-8")
-        sig = raw[tail_start - SIG_LEN : tail_start]
-        body = raw[1 : tail_start - SIG_LEN]
+        sig = raw[tail_start - sig_len : tail_start]
+        body = raw[1 : tail_start - sig_len]
     else:
         body = raw[1:]
         signer = None
@@ -160,7 +173,12 @@ def parse_payload(raw, verify_pw=None):
         raise ValueError("payload 헤더가 손상되었습니다")
 
     if signer and sig is not None:
-        sig_ok = _verify_hmac(text_body, sig, signer, verify_pw) if verify_pw else None
+        if flag & FLAG_SIG_ED25519:
+            # Ed25519: public-key verification — no password needed
+            sig_ok = verify_data(text_body, sig, signer)
+        else:
+            # HMAC legacy: password required
+            sig_ok = verify_data(text_body, sig, signer, verify_pw) if verify_pw else None
     else:
         sig_ok = None
 
