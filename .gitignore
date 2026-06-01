@@ -5,3 +5,7 @@ __pycache__/
 *.pyd
 .DS_Store
 *.log
+
+# TriCode runtime data (keys and enrollment DB contain secrets)
+tricode_keys/
+tricode_server.json
