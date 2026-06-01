@@ -133,7 +133,7 @@ def _match_binary(binary, templates, thresh, photo_mode=False):
 
     if photo_mode:
         existing_cpx = set(by_cpx.keys())
-        for cpx in range(4, min(h // 4, 61)):
+        for cpx in range(4, min(h // 4, 41)):  # practical max 40; covers all real-world cell sizes
             if cpx in existing_cpx:
                 continue
             a_px = ANCHOR_SIZE * cpx
@@ -174,7 +174,9 @@ def _match_binary(binary, templates, thresh, photo_mode=False):
         if n > bk[0] or (n == bk[0] and err < bk[1]):
             best = list(cm.values())
             bk = (n, err)
-        if n == 4 and err < 0.10:
+        # Only break early when scores are high-confidence — prevents wrong cpx winning
+        # at low score over the correct cpx with perfect score
+        if n == 4 and err < 0.10 and all(a["score"] >= 0.85 for a in cm.values()):
             break
     return best
 

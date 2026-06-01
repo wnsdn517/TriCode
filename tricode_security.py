@@ -1,4 +1,7 @@
-"""Enrollment and HMAC signing helpers."""
+"""Enrollment and signing helpers — Ed25519 (PyNaCl required).
+
+Sign with private key (password-protected); verify with stored public key (no password).
+"""
 
 import base64
 import hashlib
@@ -8,12 +11,12 @@ import os
 import secrets
 
 try:
-    from cryptography.fernet import Fernet
-    _FERNET = True
-except BaseException:
-    _FERNET = False
+    import nacl.signing
+    import nacl.exceptions
+except ImportError:
+    raise ImportError("PyNaCl is required: pip install pynacl")
 
-from tricode_common import KEYS_DIR, SERVER_DB, SIG_LEN
+from tricode_common import KEYS_DIR, SERVER_DB, SIG_LEN_ED25519
 
 
 def _db_load():
@@ -32,30 +35,20 @@ def _key_path(name):
     return os.path.join(KEYS_DIR, f"{name}.key")
 
 
-def _pw_to_fernet_key(password: str, salt: bytes) -> bytes:
-    raw = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000, 32)
-    return base64.urlsafe_b64encode(raw)
-
-
 def _derive_keys(password: str, salt: bytes) -> tuple[bytes, bytes]:
-    """enc_key(32B) + mac_key(32B) 를 한 번의 PBKDF2로 유도."""
+    """enc_key(32B) + mac_key(32B) — single PBKDF2 call."""
     km = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000, 64)
     return km[:32], km[32:]
 
 
-def _save_key(name: str, master_key: bytes, password: str):
+def _save_key(name: str, seed: bytes, password: str):
+    """Encrypt and persist a 32-byte Ed25519 seed using Encrypt-then-MAC."""
     os.makedirs(KEYS_DIR, exist_ok=True)
     salt = secrets.token_bytes(16)
-    if _FERNET:
-        fk = _pw_to_fernet_key(password, salt)
-        token = Fernet(fk).encrypt(master_key)
-        open(_key_path(name), "wb").write(salt + token)
-    else:
-        enc_key, mac_key = _derive_keys(password, salt)
-        ct = bytes(a ^ b for a, b in zip(master_key, enc_key))
-        # HMAC-SHA256 으로 암호문 무결성 보호 (Encrypt-then-MAC)
-        tag = hmac.new(mac_key, ct, hashlib.sha256).digest()
-        open(_key_path(name), "wb").write(salt + ct + tag)
+    enc_key, mac_key = _derive_keys(password, salt)
+    ct = bytes(a ^ b for a, b in zip(seed, enc_key))
+    tag = hmac.new(mac_key, ct, hashlib.sha256).digest()
+    open(_key_path(name), "wb").write(salt + ct + tag)
 
 
 def _load_key(name: str, password: str) -> bytes:
@@ -63,13 +56,9 @@ def _load_key(name: str, password: str) -> bytes:
     if not os.path.exists(pp):
         raise FileNotFoundError(f"키 파일 없음: {pp}")
     raw = open(pp, "rb").read()
-    salt = raw[:16]
-    if _FERNET:
-        return Fernet(_pw_to_fernet_key(password, salt)).decrypt(raw[16:])
-    # fallback: salt(16) + ct(32) + tag(32) = 80 bytes
     if len(raw) < 80:
-        raise ValueError("키 파일이 손상되었습니다 (너무 짧음). 재등록 필요.")
-    ct, tag = raw[16:48], raw[48:80]
+        raise ValueError("키 파일이 손상되었습니다. 재등록 필요.")
+    salt, ct, tag = raw[:16], raw[16:48], raw[48:80]
     enc_key, mac_key = _derive_keys(password, salt)
     expected_tag = hmac.new(mac_key, ct, hashlib.sha256).digest()
     if not hmac.compare_digest(expected_tag, tag):
@@ -81,23 +70,36 @@ def cmd_enroll(name: str, password: str):
     if os.path.exists(_key_path(name)):
         print(f"이미 존재: {name}")
         return
-    master_key = secrets.token_bytes(32)
-    _save_key(name, master_key, password)
     db = _db_load()
-    db[name] = {"algo": "hmac-sha256-16", "key_file": _key_path(name)}
+    signing_key = nacl.signing.SigningKey.generate()
+    seed = bytes(signing_key)
+    pubkey = bytes(signing_key.verify_key)
+    _save_key(name, seed, password)
+    db[name] = {
+        "algo": "ed25519",
+        "pubkey": base64.b64encode(pubkey).decode(),
+        "key_file": _key_path(name),
+    }
     _db_save(db)
-    print(f"[enroll] '{name}'  키:{_key_path(name)}  (HMAC-SHA256/16B)")
+    print(f"[enroll] '{name}'  Ed25519  공개키: {base64.b64encode(pubkey).decode()}")
+    print(f"  키파일: {_key_path(name)}  (개인키는 비번으로 보호)")
 
 
-def _sign_hmac(data: bytes, name: str, password: str) -> bytes:
-    key = _load_key(name, password)
-    return hmac.new(key, data, hashlib.sha256).digest()[:SIG_LEN]
+def sign_data(data: bytes, name: str, password: str) -> bytes:
+    """Sign data with the named Ed25519 key. Returns 64-byte signature."""
+    seed = _load_key(name, password)
+    return bytes(nacl.signing.SigningKey(seed).sign(data).signature)
 
 
-def _verify_hmac(data: bytes, sig: bytes, name: str, password: str) -> bool:
+def verify_data(data: bytes, sig: bytes, name: str, password: str = None) -> bool:
+    """Verify Ed25519 signature using stored public key (no password needed)."""
     try:
-        key = _load_key(name, password)
-        expected = hmac.new(key, data, hashlib.sha256).digest()[:SIG_LEN]
-        return hmac.compare_digest(expected, sig)
+        db = _db_load()
+        pubkey_b64 = db.get(name, {}).get("pubkey")
+        if not pubkey_b64:
+            return False
+        vk = nacl.signing.VerifyKey(base64.b64decode(pubkey_b64))
+        vk.verify(data, sig)
+        return True
     except Exception:
         return False
