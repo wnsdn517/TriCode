@@ -49,8 +49,9 @@ def _rotate_pat(pat, n90):
     return p
 
 
+@lru_cache(maxsize=512)
 def render_anchor(corner, cell_px, n90=0):
-    """Return anchor image as a grayscale ndarray."""
+    """Return anchor image as a grayscale ndarray (cached)."""
     pat = _rotate_pat(ANCHOR_PATTERNS[corner], n90)
     sz = ANCHOR_SIZE * cell_px
     img = Image.new("L", (sz, sz), 255)
@@ -60,7 +61,9 @@ def render_anchor(corner, cell_px, n90=0):
             x0 = dc * cell_px
             y0 = dr * cell_px
             _draw_anchor_cell(d, x0, y0, x0 + cell_px, y0 + cell_px, pat[dr][dc])
-    return np.array(img)
+    arr = np.array(img)
+    arr.flags.writeable = False
+    return arr
 
 
 _SCALES = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)

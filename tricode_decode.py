@@ -7,6 +7,7 @@ through `parse_payload()` so signature and compression work correctly.
 import math
 import os
 from collections import deque
+from functools import lru_cache
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -36,6 +37,7 @@ except AttributeError:
     _NEAREST = Image.NEAREST
 
 
+@lru_cache(maxsize=64)
 def _get_masks(px: int) -> dict:
     y, x = np.mgrid[0:px, 0:px]
     return {
@@ -44,6 +46,18 @@ def _get_masks(px: int) -> dict:
         TRI_DR: y > (px - 1 - x),
         TRI_DL: y >= x,
     }
+
+
+_MASK_DIRS = (TRI_UL, TRI_UR, TRI_DR, TRI_DL)
+
+
+@lru_cache(maxsize=64)
+def _get_mask_stack(px: int):
+    """Return (4, px, px) int16 mask array for vectorized scoring."""
+    masks = _get_masks(px)
+    arr = np.stack([masks[k] for k in _MASK_DIRS]).astype(np.int16)
+    arr.flags.writeable = False
+    return arr
 
 
 def _image_bg_value(arr_gray: np.ndarray) -> float:
@@ -106,6 +120,7 @@ def _read_cell_np(arr, r0, c0, px, masks, bg_val):
     return max(scores, key=scores.get), sv[0] - sv[1]
 
 
+@lru_cache(maxsize=32)
 def _anchor_cells(side: int):
     a = ANCHOR_SIZE
     b = ANCHOR_BUF
@@ -126,9 +141,21 @@ def _anchor_cells(side: int):
     return cells
 
 
+@lru_cache(maxsize=32)
 def _data_pos(side):
     reserved = _anchor_cells(side)
     return [(r, c) for r in range(side) for c in range(side) if (r, c) not in reserved]
+
+
+@lru_cache(maxsize=32)
+def _data_pos_np(side):
+    """Return (row_array, col_array) for data cells as numpy int32 arrays."""
+    pos = _data_pos(side)
+    if not pos:
+        return np.empty(0, np.int32), np.empty(0, np.int32)
+    rs = np.array([r for r, _ in pos], dtype=np.int32)
+    cs = np.array([c for _, c in pos], dtype=np.int32)
+    return rs, cs
 
 
 def _dibits_to_bytes(dibits):
@@ -317,35 +344,58 @@ def _decode_once(img: Image.Image, templates, thresh, photo_mode, verify_pw=None
 
 
 def _decode_raw_from_anchor(arr, side, cpx_f, r_anchor_center, c_anchor_center, corner):
-    """Decode cells using anchor CENTER coordinates for accurate grid alignment."""
+    """Decode cells using anchor CENTER — vectorized NumPy implementation."""
     ah, aw = arr.shape[:2]
     cpx = max(1, round(cpx_f))
-    masks = _get_masks(cpx)
     bg_val = _image_bg_value(arr)
-    REF = {
+    _REF = {
         "TL": (0, 0),
         "TR": (0, side - ANCHOR_SIZE),
         "BL": (side - ANCHOR_SIZE, 0),
         "BR": (side - ANCHOR_SIZE, side - ANCHOR_SIZE),
     }
-    r_ref, c_ref = REF[corner]
-    # Anchor bounding box center = (r_ref + ANCHOR_SIZE/2, c_ref + ANCHOR_SIZE/2) in cell units from grid origin.
-    # Solve for grid origin:
+    r_ref, c_ref = _REF[corner]
     grid_origin_r = r_anchor_center - (r_ref + ANCHOR_SIZE / 2) * cpx_f
     grid_origin_c = c_anchor_center - (c_ref + ANCHOR_SIZE / 2) * cpx_f
-    dibits = []
-    confs = []
-    for (r, c) in _data_pos(side):
-        r0 = round(grid_origin_r + r * cpx_f)
-        c0 = round(grid_origin_c + c * cpx_f)
-        if r0 < 0 or r0 + cpx > ah or c0 < 0 or c0 + cpx > aw:
-            dibits.append(0)
-            confs.append(0)
+
+    pos_r, pos_c = _data_pos_np(side)
+    n_total = len(pos_r)
+    if n_total == 0:
+        return b"", []
+
+    r0s = np.round(grid_origin_r + pos_r.astype(np.float64) * cpx_f).astype(np.int32)
+    c0s = np.round(grid_origin_c + pos_c.astype(np.float64) * cpx_f).astype(np.int32)
+    valid = (r0s >= 0) & (r0s + cpx <= ah) & (c0s >= 0) & (c0s + cpx <= aw)
+    valid_idx = np.where(valid)[0]
+    n_valid = len(valid_idx)
+
+    dibits = np.zeros(n_total, dtype=np.int32)
+    confs = np.zeros(n_total, dtype=np.int32)
+
+    if n_valid > 0:
+        cells = np.empty((n_valid, cpx, cpx), dtype=np.uint8)
+        for i, vi in enumerate(valid_idx):
+            cells[i] = arr[r0s[vi]:r0s[vi] + cpx, c0s[vi]:c0s[vi] + cpx]
+
+        # Binarize all cells at once
+        if bg_val >= 128:
+            fg = (cells < int(bg_val * 0.55)).astype(np.int16)
         else:
-            d, conf = _read_cell_np(arr, r0, c0, cpx, masks, bg_val)
-            dibits.append(d)
-            confs.append(conf)
-    return _dibits_to_bytes(dibits), confs
+            thresh = min(255, int(bg_val + (255 - bg_val) * 0.45))
+            fg = (cells > thresh).astype(np.int16)
+
+        # Score each cell against 4 triangle masks: (n_valid, 4)
+        mask_stack = _get_mask_stack(cpx)
+        scores = np.einsum('nij,kij->nk', fg, mask_stack)
+
+        best_k = np.argmax(scores, axis=1)
+        top2 = np.sort(scores, axis=1)[:, -2:]
+        conf = (top2[:, 1] - top2[:, 0]).astype(np.int32)
+
+        dibits[valid_idx] = np.array([_MASK_DIRS[k] for k in best_k], dtype=np.int32)
+        confs[valid_idx] = conf
+
+    return _dibits_to_bytes(dibits.tolist()), confs.tolist()
 
 
 def _decode_upright_pure_python(img: Image.Image, verify_pw=None):
@@ -574,11 +624,12 @@ def _is_plausible_text(parsed) -> bool:
     text = str(parsed.get("text", ""))
     if len(text) < 2:
         return False
-    # 출력 불가능한 제어 문자(탭/줄바꿈 제외)가 있으면 거짓
     if any(ord(ch) < 32 and ch not in "\n\r\t" for ch in text):
         return False
-    printable = sum(32 <= ord(ch) <= 126 or ch in "\n\r\t" for ch in text)
-    return printable / len(text) >= 0.90
+    repl = text.count("�")
+    # ASCII printable (32-126) OR non-ASCII Unicode (Korean, CJK, emoji) OR \n\r\t
+    good = sum(32 <= ord(ch) <= 126 or ord(ch) > 127 or ch in "\n\r\t" for ch in text) - repl
+    return good / max(len(text), 1) >= 0.80
 
 
 def _geo_cpx(rect, side):
@@ -616,15 +667,14 @@ def _decode_with_anchor(rot_gray, anchors, rect, verify_pw=None):
         min_side = ANCHOR_SIZE * 2 + ANCHOR_BUF * 2 + 2
         side_candidates = []
 
-        # From rect["side"] ± narrow range (fast path for aligned templates)
+        # Rect-based side FIRST — reconstruct_rect gives the correct side directly
         if rect.get("side"):
-            for delta in range(-3, 4):
+            for delta in (0, 1, -1, 2, -2, 3, -3):
                 s = rect["side"] + delta
                 if s >= min_side:
                     side_candidates.append(s)
 
-        # Span-based side estimates: sweep cpx hypotheses around anchor["cpx"]
-        # This covers the case where cpx_template ≠ cpx_actual
+        # Span-based as fallback when rect side is off
         if _span > 0 and anchor.get("cpx"):
             base = int(anchor["cpx"])
             for cpx_hyp in range(max(4, base - 8), min(40, base + 9)):
@@ -637,17 +687,18 @@ def _decode_with_anchor(rot_gray, anchors, rect, verify_pw=None):
         for side in side_candidates:
             cpx_candidates = []
 
-            # Geometry-derived cpx (most accurate — independent of template size)
+            # Geometry-derived cpx first (most accurate — independent of template size)
+            # Try delta=0 before ±1 so the exact geo estimate is tried first
             geo = _geo_cpx(rect, side)
             if geo and geo > 0:
-                for delta in (-1, 0, 1):
+                for delta in (0, -1, 1):
                     c = max(1, round(geo + delta))
                     if c not in cpx_candidates:
                         cpx_candidates.append(c)
 
             # Template-size cpx as fallback
             base_cpx = float(anchor.get("cpx", 0))
-            for delta in (-1, 0, 1):
+            for delta in (0, -1, 1):
                 c = max(1, round(base_cpx + delta)) if base_cpx else None
                 if c and c not in cpx_candidates:
                     cpx_candidates.append(c)
