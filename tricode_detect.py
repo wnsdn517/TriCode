@@ -39,9 +39,15 @@ def preprocess(gray_or_bgr, photo_mode=False):
     g = cv2.cvtColor(gray_or_bgr, cv2.COLOR_BGR2GRAY) if gray_or_bgr.ndim == 3 else gray_or_bgr.copy()
     enh = _get_clahe(photo_mode).apply(g)
     if photo_mode:
+        # 사진: 언샵 + 대형 블록 크기 적응형 임계값
         blur = cv2.GaussianBlur(enh, (0, 0), 1.5)
         enh = np.clip(cv2.addWeighted(enh, 1.8, blur, -0.8, 0), 0, 255).astype(np.uint8)
-    binary = cv2.adaptiveThreshold(enh, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+        binary = cv2.adaptiveThreshold(
+            enh, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 51, 4
+        )
+    else:
+        # 클린 디지털 이미지: Otsu 전역 임계값 — CELL_FULL 등 대형 균일 블록에 강인
+        _, binary = cv2.threshold(enh, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     return enh, binary
 
 
@@ -74,6 +80,23 @@ def _geom_err(cm):
         err += abs(sum(dh) / len(dh) - sum(dv) / len(dv)) / (max(sum(dh) / len(dh), sum(dv) / len(dv)) + 1e-6)
         cnt += 1
     return err / max(cnt, 1)
+
+
+def _corner_quadrant_valid(cm):
+    """Return True if each detected corner lies in the expected image quadrant."""
+    if len(cm) < 4:
+        return True
+    cxs = [v["cx"] for v in cm.values()]
+    cys = [v["cy"] for v in cm.values()]
+    cx_mid = (min(cxs) + max(cxs)) / 2
+    cy_mid = (min(cys) + max(cys)) / 2
+    checks = {
+        "TL": lambda v: v["cx"] < cx_mid and v["cy"] < cy_mid,
+        "TR": lambda v: v["cx"] > cx_mid and v["cy"] < cy_mid,
+        "BL": lambda v: v["cx"] < cx_mid and v["cy"] > cy_mid,
+        "BR": lambda v: v["cx"] > cx_mid and v["cy"] > cy_mid,
+    }
+    return all(checks[c](cm[c]) for c in cm if c in checks)
 
 
 def _match_binary(binary, templates, thresh, photo_mode=False):
@@ -146,6 +169,8 @@ def _match_binary(binary, templates, thresh, photo_mode=False):
     for cpx, cm in sorted(by_cpx.items(), key=lambda x: -x[0]):
         n = len(cm)
         err = _geom_err(cm)
+        if n == 4 and not _corner_quadrant_valid(cm):
+            err += 10.0  # large penalty: all 4 found but corners are in wrong quadrants
         if n > bk[0] or (n == bk[0] and err < bk[1]):
             best = list(cm.values())
             bk = (n, err)
@@ -171,8 +196,13 @@ def detect_anchors(gray, templates, thresh_init=0.60, photo_mode=False):
     mini = _get_coarse_templates(scale)
     coarse_thresh = min(thresh_init, 0.50)
 
-    # Coarse sweep uses wider steps to cut the number of expensive warps/matches.
-    for ang in [0, -10, 10, -20, 20, -30, 30, -40, 40]:
+    # 소각도 먼저, 이후 90/180/270 대회전까지 전방향 탐색
+    coarse_angles = [0]
+    for step in range(10, 50, 10):
+        coarse_angles.extend([-step, step])
+    coarse_angles.extend([90, -90, 135, -135, 180])
+
+    for ang in coarse_angles:
         gs = _warp_gray(gray, ang)
         gs_s = cv2.resize(gs, (int(w * scale), int(h * scale)))
         _, bs = preprocess(gs_s, photo_mode)

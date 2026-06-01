@@ -5,8 +5,8 @@ from functools import lru_cache
 
 from PIL import Image, ImageDraw
 
-from tricode_rs import rs_encode
-from tricode_common import ANCHOR_PATTERNS, ANCHOR_BUF, ANCHOR_SIZE, CELL_EMPTY, CELL_FULL, CELL_PX, MARGIN, codeword_permute, ecc_ratio_for_data
+from tricode_rs import rs_encode_multiblock
+from tricode_common import ANCHOR_PATTERNS, ANCHOR_BUF, ANCHOR_SIZE, CELL_EMPTY, CELL_FULL, CELL_PX, MARGIN, ecc_ratio_for_data
 from tricode_payload import build_payload
 from tricode_render import _tri_pts
 
@@ -67,7 +67,7 @@ def encode(text, cell_px=CELL_PX, margin=MARGIN, sign_name=None, sign_pw=None, r
     nd = len(payload)
     signed = bool(sign_name and sign_pw)
     side, nsym = _layout(nd, signed=signed)
-    enc = codeword_permute(rs_encode(payload, nsym))
+    enc = rs_encode_multiblock(payload, nsym)
     dibits = bytearray(len(enc) * 4)
     for i, b in enumerate(enc):
         base = i * 4
