@@ -4,9 +4,9 @@ import struct
 import zlib
 
 from tricode_common import (
-    FLAG_SIG, FLAG_SIG_ED25519, FLAG_ZLIB,
+    FLAG_SIG_ED25519, FLAG_ZLIB,
     MODE_A7, MODE_AN, MODE_U8,
-    SIG_LEN, SIG_LEN_ED25519,
+    SIG_LEN_ED25519,
     _AI, _AN,
 )
 from tricode_security import sign_data, verify_data
@@ -118,11 +118,7 @@ def build_payload(text, sign_name=None, sign_pw=None, return_meta=False):
         if len(name_bytes) > 0xFF:
             raise ValueError("서명자 이름이 너무 깁니다 (최대 255바이트)")
         sig = sign_data(text_body, sign_name, sign_pw)
-        # Set the right flag based on sig length
-        if len(sig) == SIG_LEN_ED25519:
-            flag |= FLAG_SIG_ED25519
-        else:
-            flag |= FLAG_SIG
+        flag |= FLAG_SIG_ED25519
         tail = sig + name_bytes + struct.pack("B", len(name_bytes))
         payload = struct.pack("B", flag) + body + tail
     else:
@@ -145,13 +141,7 @@ def parse_payload(raw, verify_pw=None):
         raise ValueError("빈 payload")
     flag = raw[0]
 
-    # Determine signature length from flag
-    if flag & FLAG_SIG_ED25519:
-        sig_len = SIG_LEN_ED25519
-    elif flag & FLAG_SIG:
-        sig_len = SIG_LEN
-    else:
-        sig_len = 0
+    sig_len = SIG_LEN_ED25519 if (flag & FLAG_SIG_ED25519) else 0
 
     if sig_len > 0:
         if len(raw) < sig_len + 2:
@@ -172,15 +162,7 @@ def parse_payload(raw, verify_pw=None):
     if len(text_body) < 3:
         raise ValueError("payload 헤더가 손상되었습니다")
 
-    if signer and sig is not None:
-        if flag & FLAG_SIG_ED25519:
-            # Ed25519: public-key verification — no password needed
-            sig_ok = verify_data(text_body, sig, signer)
-        else:
-            # HMAC legacy: password required
-            sig_ok = verify_data(text_body, sig, signer, verify_pw) if verify_pw else None
-    else:
-        sig_ok = None
+    sig_ok = verify_data(text_body, sig, signer) if (signer and sig is not None) else None
 
     m, char_len = struct.unpack(">BH", text_body[:3])
     enc_bytes = text_body[3:]

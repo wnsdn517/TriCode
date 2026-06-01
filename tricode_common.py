@@ -79,11 +79,9 @@ SERVER_DB = os.path.join(HERE, "tricode_server.json")
 KEYS_DIR = os.path.join(HERE, "tricode_keys")
 TMPL_DIR = os.path.join(HERE, "tricode_templates")
 
-SIG_LEN = 16             # HMAC legacy
 SIG_LEN_ED25519 = 64     # Ed25519
 FLAG_ZLIB = 0x01
-FLAG_SIG = 0x02          # HMAC legacy (16-byte sig, needs password to verify)
-FLAG_SIG_ED25519 = 0x04  # Ed25519   (64-byte sig, public-key verifiable — no password)
+FLAG_SIG_ED25519 = 0x04  # Ed25519 (64-byte sig, public-key verifiable — no password)
 
 _AN = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz "[:62]
 _AI = {c: i for i, c in enumerate(_AN)}
