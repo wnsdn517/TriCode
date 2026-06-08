@@ -89,6 +89,17 @@ def _mask_bbox(mask: np.ndarray):
     return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
 
 
+def _dense_bbox(mask: np.ndarray, min_density: float = 0.10):
+    """밀도 기반 bbox: 마진의 salt-and-pepper 노이즈에 강인한 TriCode 영역 검출."""
+    row_d = mask.mean(axis=1)
+    col_d = mask.mean(axis=0)
+    dense_rows = np.where(row_d >= min_density)[0]
+    dense_cols = np.where(col_d >= min_density)[0]
+    if len(dense_rows) == 0 or len(dense_cols) == 0:
+        return _mask_bbox(mask)
+    return int(dense_cols[0]), int(dense_rows[0]), int(dense_cols[-1]), int(dense_rows[-1])
+
+
 def _resize_gray(arr: np.ndarray, size):
     if arr.size == 0:
         return arr
@@ -169,12 +180,14 @@ def _dibits_to_bytes(dibits):
 
 
 def _candidate_data_lengths(total_bytes):
-    # 서명 여부(signed)에 따라 ECC 비율이 달라지므로 둘 다 시도하고 중복 제거.
+    # MIN→MAX 순서로 탐색: 올바른 split이 잘못된 subset-syndrome 허위 양성보다 먼저 발견됨.
+    # (MAX→MIN은 n_data+k 가 n_data보다 먼저 시도되어 하위 syndrome 집합이 모두 0인 경우
+    #  잘못된 split이 통과하는 버그가 있음)
     max_data = max(1, total_bytes - 4)
     seen: set = set()
-    for signed in (False, True):
-        for n_data in range(max_data, 0, -1):
-            nsym = total_bytes - n_data
+    for n_data in range(1, max_data + 1):
+        nsym = total_bytes - n_data
+        for signed in (False, True):
             ecc_ratio = ecc_ratio_for_data(n_data, signed=signed)
             min_nsym = max(4, math.ceil(n_data * ecc_ratio / (1 - ecc_ratio)))
             if nsym >= min_nsym:
@@ -405,42 +418,54 @@ def _decode_upright_pure_python(img: Image.Image, verify_pw=None):
     mask = arr <= thr
     h, w = mask.shape
     bbox_candidates = []
-    bbox = _mask_bbox(mask)
-    if bbox is not None:
-        bbox_candidates.append(bbox)
-        x0, y0, x1, y1 = bbox
-        if x0 <= 1 or y0 <= 1 or x1 >= w - 2 or y1 >= h - 2 or (x1 - x0 + 1) > int(w * 0.9) or (y1 - y0 + 1) > int(h * 0.9):
-            for trim in (0.03, 0.05, 0.08, 0.12):
-                x0t = int(w * trim)
-                y0t = int(h * trim)
-                x1t = int(w * (1.0 - trim))
-                y1t = int(h * (1.0 - trim))
-                if x1t <= x0t or y1t <= y0t:
-                    continue
-                sub = mask[y0t:y1t, x0t:x1t]
-                bb = _mask_bbox(sub)
-                if bb is not None:
-                    bbox_candidates.append((bb[0] + x0t, bb[1] + y0t, bb[2] + x0t, bb[3] + y0t))
-    if not bbox_candidates:
-        raise ValueError("TriQR 영역을 찾지 못했습니다")
 
-    def _bbox_score(box):
-        bx0, by0, bx1, by1 = box
-        bw = bx1 - bx0 + 1
-        bh = by1 - by0 + 1
-        ratio = bw / max(bh, 1)
-        edge_penalty = 0
-        if bx0 <= 1:
-            edge_penalty += 1
-        if by0 <= 1:
-            edge_penalty += 1
-        if bx1 >= w - 2:
-            edge_penalty += 1
-        if by1 >= h - 2:
-            edge_penalty += 1
-        return (edge_penalty, -bw * bh / (1.0 + abs(1.0 - ratio) * 10.0), bw * bh)
+    # 밀도 기반 bbox를 우선 시도: salt-and-pepper 노이즈에 강인.
+    # 엣지에 닿지 않는 유효한 dense_bb는 바로 사용 (trimmed mask_bb보다 항상 신뢰도 높음).
+    dense_bb = _dense_bbox(mask, min_density=0.10)
+    x0 = y0 = x1 = y1 = None
 
-    x0, y0, x1, y1 = sorted(bbox_candidates, key=_bbox_score)[0]
+    if dense_bb is not None:
+        dx0, dy0, dx1, dy1 = dense_bb
+        if dx1 - dx0 >= 39 and dy1 - dy0 >= 39 and dx0 > 1 and dy0 > 1 and dx1 < w - 2 and dy1 < h - 2:
+            x0, y0, x1, y1 = dense_bb
+
+    if x0 is None:
+        # dense_bb 없거나 엣지 근접 → mask_bb + 트리밍 후보로 최적 선택
+        bbox_candidates = []
+        if dense_bb is not None:
+            bbox_candidates.append(dense_bb)
+        bbox = _mask_bbox(mask)
+        if bbox is not None and bbox != dense_bb:
+            bbox_candidates.append(bbox)
+            bx0, by0, bx1, by1 = bbox
+            if bx0 <= 1 or by0 <= 1 or bx1 >= w - 2 or by1 >= h - 2 or (bx1 - bx0 + 1) > int(w * 0.9) or (by1 - by0 + 1) > int(h * 0.9):
+                for trim in (0.03, 0.05, 0.08, 0.12):
+                    x0t = int(w * trim)
+                    y0t = int(h * trim)
+                    x1t = int(w * (1.0 - trim))
+                    y1t = int(h * (1.0 - trim))
+                    if x1t <= x0t or y1t <= y0t:
+                        continue
+                    sub = mask[y0t:y1t, x0t:x1t]
+                    bb = _mask_bbox(sub)
+                    if bb is not None:
+                        bbox_candidates.append((bb[0] + x0t, bb[1] + y0t, bb[2] + x0t, bb[3] + y0t))
+        if not bbox_candidates:
+            raise ValueError("TriQR 영역을 찾지 못했습니다")
+
+        def _bbox_score(box):
+            bx0, by0, bx1, by1 = box
+            bw = bx1 - bx0 + 1
+            bh = by1 - by0 + 1
+            ratio = bw / max(bh, 1)
+            edge_penalty = 0
+            if bx0 <= 1: edge_penalty += 1
+            if by0 <= 1: edge_penalty += 1
+            if bx1 >= w - 2: edge_penalty += 1
+            if by1 >= h - 2: edge_penalty += 1
+            return (edge_penalty, -bw * bh / (1.0 + abs(1.0 - ratio) * 10.0), bw * bh)
+
+        x0, y0, x1, y1 = sorted(bbox_candidates, key=_bbox_score)[0]
     bw = x1 - x0 + 1
     bh = y1 - y0 + 1
     if bw < 40 or bh < 40:
@@ -745,7 +770,26 @@ def decode_image(img: Image.Image, templates=None, thresh=0.55, photo_mode=False
                 return _decode_upright_pure_python(prepared, verify_pw=verify_pw)
             except Exception:
                 pass
-        return _decode_upright_pure_python(img, verify_pw=verify_pw)
+        try:
+            return _decode_upright_pure_python(img, verify_pw=verify_pw)
+        except ValueError:
+            pass
+        _fill = (255, 255, 255) if img.mode == "RGB" else 255
+        _best = None
+        for _ang in (-1, 1, -2, 2, -3, 3, -5, 5, -7, 7, -10, 10, -15, 15):
+            try:
+                rotated = img.rotate(-_ang, expand=True, fillcolor=_fill)
+                _res = _decode_upright_pure_python(rotated, verify_pw=verify_pw)
+                _text = _res[0].get("text", "") if isinstance(_res, tuple) else _res.get("text", "")
+                if _text:
+                    return _res
+                if _best is None:
+                    _best = _res
+            except ValueError:
+                continue
+        if _best is not None:
+            return _best
+        raise ValueError("복호 실패 (회전 보정 포함)")
 
     orig_img = img
     candidates = []
