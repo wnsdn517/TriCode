@@ -11,9 +11,9 @@ from functools import lru_cache
 CELL_PX = 20
 MARGIN = 2
 ANCHOR_SIZE = 3
-ANCHOR_BUF = 1
+ANCHOR_BUF = 0
 ECC_RATIO = 0.24
-ANCHOR_SCHEMA = "v3"
+ANCHOR_SCHEMA = "v4"
 
 TRI_UL = 0b00
 TRI_UR = 0b01
