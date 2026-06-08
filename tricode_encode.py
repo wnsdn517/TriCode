@@ -12,13 +12,32 @@ from tricode_render import _tri_pts, _TRI_FRAC
 
 _BYTE_TO_DIBITS = tuple(((b >> 6) & 3, (b >> 4) & 3, (b >> 2) & 3, b & 3) for b in range(256))
 
-# Dot center as fraction of cell_px: (row_frac, col_frac) — same mapping as data cells
-_DOT_CENTER = {
-    TRI_UL: (0.25, 0.25),
-    TRI_UR: (0.25, 0.75),
-    TRI_DR: (0.75, 0.75),
-    TRI_DL: (0.75, 0.25),
-}
+
+def _corner_tri_pts(x0: int, y0: int, px: int, dibit: int):
+    """Small right-angle triangle at one of 4 cell corners — encodes 2-bit dibit.
+
+    Each triangle is confined to its quadrant, so the quadrant decoder masks
+    score it unambiguously (correct quadrant ~t²/2 px, others 0).
+    """
+    q = px // 2          # quadrant side
+    p = max(1, px // 10) # padding from cell edge
+    t = q - 2 * p        # triangle leg length
+    if dibit == TRI_UL:  # top-left corner ↖
+        return [(x0 + p,     y0 + p),
+                (x0 + p + t, y0 + p),
+                (x0 + p,     y0 + p + t)]
+    if dibit == TRI_UR:  # top-right corner ↗
+        return [(x0 + q + p,     y0 + p),
+                (x0 + q + p + t, y0 + p),
+                (x0 + q + p + t, y0 + p + t)]
+    if dibit == TRI_DR:  # bottom-right corner ↘
+        return [(x0 + q + p + t, y0 + q + p),
+                (x0 + q + p + t, y0 + q + p + t),
+                (x0 + q + p,     y0 + q + p + t)]
+    # TRI_DL: bottom-left corner ↙
+    return [(x0 + p,     y0 + q + p),
+            (x0 + p + t, y0 + q + p + t),
+            (x0 + p,     y0 + q + p + t)]
 
 
 def _draw_anchor_cell(draw, x0, y0, x1, y1, code):
@@ -111,14 +130,12 @@ def encode(text, cell_px=CELL_PX, margin=MARGIN, sign_name=None, sign_pw=None, r
                 x0 = (c0 + dc + margin) * cell_px
                 y0 = (r0 + dr + margin) * cell_px
                 _draw_anchor_cell(d, x0, y0, x0 + cell_px, y0 + cell_px, ANCHOR_PATTERNS[corner][dr][dc])
-    # Data cells: small dot at one of 4 quadrant positions — cleaner than triangles.
-    rad = max(2, cell_px // 6)
+    # Data cells: small corner triangle — encodes dibit as corner position.
     for i, (r, c) in enumerate(pos):
         dv = dibits[i] if i < len(dibits) else 0
-        rf, cf = _DOT_CENTER[dv]
-        cx = int((c + margin) * cell_px + cf * cell_px)
-        cy = int((r + margin) * cell_px + rf * cell_px)
-        d.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], fill=(28, 28, 28))
+        cx = (c + margin) * cell_px
+        cy = (r + margin) * cell_px
+        d.polygon(_corner_tri_pts(cx, cy, cell_px, dv), fill=(28, 28, 28))
     img = _rounded_corners(img, radius=cell_px * margin // 2)
     if return_info:
         return img, {
