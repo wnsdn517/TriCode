@@ -19,6 +19,15 @@ def _tri_pts(x0, y0, x1, y1, d):
     return [(x0, y0), (x1, y1), (x0, y1)]
 
 
+# Row-fraction, col-fraction of the indicator dot center for each triangle direction.
+_TRI_FRAC = {
+    TRI_UL: (0.25, 0.25),
+    TRI_UR: (0.25, 0.75),
+    TRI_DR: (0.75, 0.75),
+    TRI_DL: (0.75, 0.25),
+}
+
+
 def _draw_anchor_cell(draw, x0, y0, x1, y1, code):
     if code == CELL_FULL:
         draw.rectangle([x0, y0, x1, y1], fill=0)
@@ -54,28 +63,29 @@ def render_anchor(corner, cell_px, n90=0):
     """Return anchor image as a grayscale ndarray (cached)."""
     pat = _rotate_pat(ANCHOR_PATTERNS[corner], n90)
     sz = ANCHOR_SIZE * cell_px
-    arr = np.full((sz, sz), 255, dtype=np.uint8)
-
-    y_l, x_l = np.mgrid[0:cell_px, 0:cell_px]
-    tri_masks = {
-        TRI_UL: y_l < (cell_px - x_l),
-        TRI_UR: y_l <= x_l,
-        TRI_DR: y_l > (cell_px - 1 - x_l),
-        TRI_DL: y_l >= x_l,
-    }
+    img = Image.new("L", (sz, sz), 255)
+    draw = ImageDraw.Draw(img)
+    rr  = max(1, cell_px // 4)   # corner radius for filled squares
+    rad = max(1, cell_px // 5)   # circle radius for indicator dots
 
     for dr in range(ANCHOR_SIZE):
         for dc in range(ANCHOR_SIZE):
             code = pat[dr][dc]
             if code == CELL_EMPTY:
                 continue
-            r0, c0 = dr * cell_px, dc * cell_px
-            cell = arr[r0:r0 + cell_px, c0:c0 + cell_px]
+            x0 = dc * cell_px
+            y0 = dr * cell_px
+            x1 = x0 + cell_px - 1
+            y1 = y0 + cell_px - 1
             if code == CELL_FULL:
-                cell[:] = 0
-            elif code in tri_masks:
-                cell[tri_masks[code]] = 0
+                draw.rounded_rectangle([x0, y0, x1, y1], radius=rr, fill=0)
+            else:
+                ry, rx = _TRI_FRAC[code]
+                cx = int(x0 + rx * cell_px)
+                cy = int(y0 + ry * cell_px)
+                draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], fill=0)
 
+    arr = np.array(img)
     arr.flags.writeable = False
     return arr
 

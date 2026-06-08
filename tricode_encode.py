@@ -8,11 +8,11 @@ from PIL import Image, ImageDraw
 from tricode_rs import rs_encode_multiblock
 from tricode_common import ANCHOR_PATTERNS, ANCHOR_BUF, ANCHOR_SIZE, CELL_EMPTY, CELL_FULL, CELL_PX, MARGIN, TRI_UL, TRI_UR, TRI_DR, TRI_DL, ecc_ratio_for_data
 from tricode_payload import build_payload
-from tricode_render import _tri_pts
+from tricode_render import _tri_pts, _TRI_FRAC
 
 _BYTE_TO_DIBITS = tuple(((b >> 6) & 3, (b >> 4) & 3, (b >> 2) & 3, b & 3) for b in range(256))
 
-# Dot center as fraction of cell_px: (row_frac, col_frac)
+# Dot center as fraction of cell_px: (row_frac, col_frac) — same mapping as data cells
 _DOT_CENTER = {
     TRI_UL: (0.25, 0.25),
     TRI_UR: (0.25, 0.75),
@@ -22,12 +22,19 @@ _DOT_CENTER = {
 
 
 def _draw_anchor_cell(draw, x0, y0, x1, y1, code):
+    px = x1 - x0
     if code == CELL_FULL:
-        draw.rectangle([x0, y0, x1, y1], fill=(10, 10, 10))
+        rr = max(1, px // 4)
+        draw.rounded_rectangle([x0, y0, x1 - 1, y1 - 1], radius=rr, fill=(10, 10, 10))
         return
     if code == CELL_EMPTY:
         return
-    draw.polygon(_tri_pts(x0, y0, x1, y1, code), fill=(10, 10, 10))
+    # Triangle cell → indicator circle at the corresponding quadrant center
+    ry, rx = _TRI_FRAC[code]
+    cx = int(x0 + rx * px)
+    cy = int(y0 + ry * px)
+    rad = max(1, px // 5)
+    draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], fill=(10, 10, 10))
 
 
 @lru_cache(maxsize=None)
