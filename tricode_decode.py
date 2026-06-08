@@ -39,12 +39,14 @@ except AttributeError:
 
 @lru_cache(maxsize=64)
 def _get_masks(px: int) -> dict:
+    # Quadrant masks: each dot lives in one quadrant, score = count of dark pixels in that quadrant.
     y, x = np.mgrid[0:px, 0:px]
+    h = px // 2
     return {
-        TRI_UL: y < (px - x),
-        TRI_UR: y <= x,
-        TRI_DR: y > (px - 1 - x),
-        TRI_DL: y >= x,
+        TRI_UL: (y < h) & (x < h),
+        TRI_UR: (y < h) & (x >= h),
+        TRI_DR: (y >= h) & (x >= h),
+        TRI_DL: (y >= h) & (x < h),
     }
 
 

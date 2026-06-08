@@ -13,7 +13,7 @@ from PIL import Image, ImageDraw, ImageFilter
 from tricode_encode import encode
 from tricode_decode import decode_image
 from tricode_render import load_templates
-from tricode_security import cmd_enroll, list_enrolled_names
+from tricode_security import list_enrolled_names
 
 TEMPLATES = load_templates()
 
@@ -197,22 +197,8 @@ def test_anchor_damage():
 
 # ── 5. authentication ─────────────────────────────────────────────────────────
 
-def _ensure_users():
-    import glob, os
-    for name, pw in (("user_alpha", PASS_ALPHA), ("user_beta", PASS_BETA)):
-        key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tricode_keys", f"{name}.key")
-        try:
-            from tricode_security import sign_data
-            sign_data(b"probe", name, pw)
-        except Exception:
-            if os.path.exists(key_path):
-                os.remove(key_path)
-            cmd_enroll(name, pw)
-
-
 def test_sign_and_verify():
     """Sign with user_alpha, verify succeeds."""
-    _ensure_users()
     text = "Signed message"
     img = _encode(text, sign_name="user_alpha", sign_pw=PASS_ALPHA)
     r = _decode(img, verify_pw=PASS_ALPHA)
@@ -220,25 +206,23 @@ def test_sign_and_verify():
 
 
 def test_sign_wrong_pw():
-    """Signing with wrong password raises an error; Ed25519 public-key verify always works."""
-    _ensure_users()
-    # Signing with wrong password must fail
-    raised = False
-    try:
-        _encode("test", sign_name="user_alpha", sign_pw="definitely_wrong_pw")
-    except Exception:
-        raised = True
-    assert raised, "Expected sign with wrong password to raise an error"
-    # Verification with any verify_pw still returns sig_ok=True (public key only needed)
+    """HMAC24: wrong verify_pw → sig_ok=False; no verify_pw → sig_ok=None."""
     text = "Signed message"
     img = _encode(text, sign_name="user_alpha", sign_pw=PASS_ALPHA)
-    r = _decode(img, verify_pw="wrong_password")
+    # Correct password: must verify
+    r = _decode(img, verify_pw=PASS_ALPHA)
     _check(r, text, signer="user_alpha", sig_ok=True)
+    # Wrong password: HMAC mismatch
+    r2 = _decode(img, verify_pw="definitely_wrong_pw")
+    _check(r2, text, signer="user_alpha", sig_ok=False)
+    # No password: cannot verify
+    r3 = _decode(img)
+    assert r3["signer"] == "user_alpha"
+    assert r3["sig_ok"] is None, f"sig_ok should be None without verify_pw, got {r3['sig_ok']}"
 
 
 def test_two_users():
     """Two different signers produce distinct, verifiable codes."""
-    _ensure_users()
     for name, pw in (("user_alpha", PASS_ALPHA), ("user_beta", PASS_BETA)):
         text = f"Message from {name}"
         img = _encode(text, sign_name=name, sign_pw=pw)
@@ -247,8 +231,7 @@ def test_two_users():
 
 
 def test_sign_with_noise():
-    """Signed code should survive 1% noise and still verify."""
-    _ensure_users()
+    """Signed code should survive 0.5% noise and still verify."""
     rng = random.Random(99)
     text = "Noisy signed message"
     img = _encode(text, sign_name="user_alpha", sign_pw=PASS_ALPHA)

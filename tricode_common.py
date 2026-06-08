@@ -81,8 +81,10 @@ KEYS_DIR = os.path.join(HERE, "tricode_keys")
 TMPL_DIR = os.path.join(HERE, "tricode_templates")
 
 SIG_LEN_ED25519 = 64     # Ed25519
+SIG_LEN_HMAC24  = 24     # HMAC-SHA256 truncated to 24 bytes
 FLAG_ZLIB = 0x01
 FLAG_SIG_ED25519 = 0x04  # Ed25519 (64-byte sig, public-key verifiable — no password)
+FLAG_SIG_HMAC24  = 0x08  # HMAC-SHA256[:24] — compact symmetric auth, password required to verify
 
 _AN = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz "[:62]
 _AI = {c: i for i, c in enumerate(_AN)}

@@ -4,12 +4,12 @@ import struct
 import zlib
 
 from tricode_common import (
-    FLAG_SIG_ED25519, FLAG_ZLIB,
+    FLAG_SIG_ED25519, FLAG_SIG_HMAC24, FLAG_ZLIB,
     MODE_A7, MODE_AN, MODE_U8,
-    SIG_LEN_ED25519,
+    SIG_LEN_ED25519, SIG_LEN_HMAC24,
     _AI, _AN,
 )
-from tricode_security import sign_data, verify_data
+from tricode_security import sign_data, sign_data_hmac24, verify_data, verify_data_hmac24
 
 
 def _sel(t):
@@ -121,8 +121,9 @@ def build_payload(text, sign_name=None, sign_pw=None, return_meta=False):
         name_bytes = sign_name.encode("utf-8")
         if len(name_bytes) > 0xFF:
             raise ValueError("서명자 이름이 너무 깁니다 (최대 255바이트)")
-        sig = sign_data(text_body, sign_name, sign_pw)
-        flag |= FLAG_SIG_ED25519
+        # HMAC24: 24-byte compact symmetric signature (saves 40 bytes vs Ed25519).
+        sig = sign_data_hmac24(text_body, sign_name, sign_pw)
+        flag |= FLAG_SIG_HMAC24
         tail = sig + name_bytes + struct.pack("B", len(name_bytes))
         payload = struct.pack("B", flag) + body + tail
     else:
@@ -145,7 +146,12 @@ def parse_payload(raw, verify_pw=None):
         raise ValueError("빈 payload")
     flag = raw[0]
 
-    sig_len = SIG_LEN_ED25519 if (flag & FLAG_SIG_ED25519) else 0
+    if flag & FLAG_SIG_HMAC24:
+        sig_len = SIG_LEN_HMAC24
+    elif flag & FLAG_SIG_ED25519:
+        sig_len = SIG_LEN_ED25519
+    else:
+        sig_len = 0
 
     if sig_len > 0:
         if len(raw) < sig_len + 2:
@@ -166,7 +172,13 @@ def parse_payload(raw, verify_pw=None):
     if len(text_body) < 3:
         raise ValueError("payload 헤더가 손상되었습니다")
 
-    sig_ok = verify_data(text_body, sig, signer) if (signer and sig is not None) else None
+    if signer and sig is not None:
+        if flag & FLAG_SIG_HMAC24:
+            sig_ok = verify_data_hmac24(text_body, sig, signer, verify_pw) if verify_pw else None
+        else:
+            sig_ok = verify_data(text_body, sig, signer)
+    else:
+        sig_ok = None
 
     m, char_len = struct.unpack(">BH", text_body[:3])
     enc_bytes = text_body[3:]

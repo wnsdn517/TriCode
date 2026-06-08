@@ -16,7 +16,8 @@ try:
 except ImportError:
     raise ImportError("PyNaCl is required: pip install pynacl")
 
-from tricode_common import KEYS_DIR, SERVER_DB, SIG_LEN_ED25519
+from tricode_common import KEYS_DIR, SERVER_DB, SIG_LEN_ED25519, SIG_LEN_HMAC24
+from functools import lru_cache
 
 
 def _db_load():
@@ -83,6 +84,28 @@ def cmd_enroll(name: str, password: str):
     _db_save(db)
     print(f"[enroll] '{name}'  Ed25519  공개키: {base64.b64encode(pubkey).decode()}")
     print(f"  키파일: {_key_path(name)}  (개인키는 비번으로 보호)")
+
+
+@lru_cache(maxsize=16)
+def _derive_hmac_key(name: str, password: str) -> bytes:
+    """PBKDF2-derived key for HMAC24 signing (cached per session to avoid repeated PBKDF2)."""
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), name.encode(), 100_000, 32)
+
+
+def sign_data_hmac24(data: bytes, name: str, password: str) -> bytes:
+    """Return 24-byte HMAC-SHA256 truncated signature. No key file needed."""
+    key = _derive_hmac_key(name, password)
+    return hmac.new(key, data, hashlib.sha256).digest()[:SIG_LEN_HMAC24]
+
+
+def verify_data_hmac24(data: bytes, sig: bytes, name: str, password: str) -> bool:
+    """Verify 24-byte HMAC. Returns False if password is wrong or data tampered."""
+    try:
+        key = _derive_hmac_key(name, password)
+        expected = hmac.new(key, data, hashlib.sha256).digest()[:SIG_LEN_HMAC24]
+        return hmac.compare_digest(expected, sig)
+    except Exception:
+        return False
 
 
 def sign_data(data: bytes, name: str, password: str) -> bytes:
