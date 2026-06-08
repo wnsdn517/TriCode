@@ -411,7 +411,7 @@ def _decode_raw_from_anchor(arr, side, cpx_f, r_anchor_center, c_anchor_center, 
     return _dibits_to_bytes(dibits.tolist()), confs.tolist()
 
 
-def _decode_upright_pure_python(img: Image.Image, verify_pw=None):
+def _decode_upright_pure_python(img: Image.Image, verify_pw=None, _rotation_corrected=False):
     """Decode a clean upright Tricode image without cv2."""
     arr = np.array(img.convert("L"))
     thr = _otsu_threshold(arr)
@@ -471,7 +471,7 @@ def _decode_upright_pure_python(img: Image.Image, verify_pw=None):
     if bw < 40 or bh < 40:
         raise ValueError("TriQR 영역이 너무 작습니다")
 
-    best = None
+    best = None  # (score, side, cpx, x0, y0, n90)
     for side in range(6, 41):
         cpx = max(1, round(min(bw, bh) / side))
         if cpx < 4:
@@ -485,37 +485,45 @@ def _decode_upright_pure_python(img: Image.Image, verify_pw=None):
         if x0 + a_px > arr.shape[1] or y0 + a_px > arr.shape[0]:
             continue
 
-        score = 0.0
-        ok = True
-        for corner in ("TL", "TR", "BL", "BR"):
-            if corner == "TL":
-                cx0, cy0 = x0, y0
-            elif corner == "TR":
-                cx0, cy0 = x1 - a_px + 1, y0
-            elif corner == "BL":
-                cx0, cy0 = x0, y1 - a_px + 1
-            else:
-                cx0, cy0 = x1 - a_px + 1, y1 - a_px + 1
+        for n90 in range(4):  # 0°/90°/180°/270° 회전 앵커 패턴 모두 시도
+            score = 0.0
+            ok = True
+            for corner in ("TL", "TR", "BL", "BR"):
+                if corner == "TL":
+                    cx0, cy0 = x0, y0
+                elif corner == "TR":
+                    cx0, cy0 = x1 - a_px + 1, y0
+                elif corner == "BL":
+                    cx0, cy0 = x0, y1 - a_px + 1
+                else:
+                    cx0, cy0 = x1 - a_px + 1, y1 - a_px + 1
 
-            if cx0 < 0 or cy0 < 0 or cx0 + a_px > arr.shape[1] or cy0 + a_px > arr.shape[0]:
-                ok = False
-                break
+                if cx0 < 0 or cy0 < 0 or cx0 + a_px > arr.shape[1] or cy0 + a_px > arr.shape[0]:
+                    ok = False
+                    break
 
-            crop = arr[cy0 : cy0 + a_px, cx0 : cx0 + a_px]
-            tmpl = render_anchor(corner, cpx, 0)
-            score += _template_match_score(crop, tmpl)
+                crop = arr[cy0 : cy0 + a_px, cx0 : cx0 + a_px]
+                tmpl = render_anchor(corner, cpx, n90)
+                score += _template_match_score(crop, tmpl)
 
-        if not ok:
-            continue
+            if not ok:
+                continue
 
-        avg = score / 4.0
-        if best is None or avg > best[0]:
-            best = (avg, side, cpx, x0, y0)
+            avg = score / 4.0
+            if best is None or avg > best[0]:
+                best = (avg, side, cpx, x0, y0, n90)
 
     if best is None:
         raise ValueError("TriQR 앵커를 판독하지 못했습니다")
 
-    _, side, cpx, x0, y0 = best
+    _, side, cpx, x0, y0, n90 = best
+
+    # 90°·180°·270° 회전이 감지된 경우: 이미지를 보정 후 재시도 (재귀 1회 한정)
+    if n90 != 0 and not _rotation_corrected:
+        _fill = (255, 255, 255) if img.mode == "RGB" else 255
+        # n90=1 → 이미지 90°CW 회전됨 → PIL.rotate(-90) 로 복원
+        corrected = img.rotate(-n90 * 90, expand=True, fillcolor=_fill)
+        return _decode_upright_pure_python(corrected, verify_pw=verify_pw, _rotation_corrected=True)
 
     best_parsed = None
     best_meta = None  # (side_try, cpx_try, x0, y0) — defer dict creation
