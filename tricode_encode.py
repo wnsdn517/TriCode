@@ -61,6 +61,15 @@ def _data_pos(side):
     return [(r, c) for r in range(side) for c in range(side) if (r, c) not in res]
 
 
+def _rounded_corners(img: Image.Image, radius: int) -> Image.Image:
+    mask = Image.new("L", img.size, 0)
+    md = ImageDraw.Draw(mask)
+    md.rounded_rectangle([0, 0, img.width - 1, img.height - 1], radius=radius, fill=255)
+    out = Image.new("RGB", img.size, (255, 255, 255))
+    out.paste(img, mask=mask)
+    return out
+
+
 def encode(text, cell_px=CELL_PX, margin=MARGIN, sign_name=None, sign_pw=None, return_info=False):
     payload_result = build_payload(text, sign_name, sign_pw, return_meta=True)
     payload, payload_meta = payload_result
@@ -87,11 +96,16 @@ def encode(text, cell_px=CELL_PX, margin=MARGIN, sign_name=None, sign_pw=None, r
                 x0 = (c0 + dc + margin) * cell_px
                 y0 = (r0 + dr + margin) * cell_px
                 _draw_anchor_cell(d, x0, y0, x0 + cell_px, y0 + cell_px, ANCHOR_PATTERNS[corner][dr][dc])
+    # Inset data triangles: breathing room between cells for a cleaner visual.
+    ins = max(1, cell_px // 10)
     for i, (r, c) in enumerate(pos):
         dv = dibits[i] if i < len(dibits) else 0
-        x0 = (c + margin) * cell_px
-        y0 = (r + margin) * cell_px
-        d.polygon(_tri_pts(x0, y0, x0 + cell_px, y0 + cell_px, dv), fill=(10, 10, 10))
+        x0 = (c + margin) * cell_px + ins
+        y0 = (r + margin) * cell_px + ins
+        x1 = (c + margin) * cell_px + cell_px - ins
+        y1 = (r + margin) * cell_px + cell_px - ins
+        d.polygon(_tri_pts(x0, y0, x1, y1, dv), fill=(28, 28, 28))
+    img = _rounded_corners(img, radius=cell_px * margin // 2)
     if return_info:
         return img, {
             "payload_len": nd,
