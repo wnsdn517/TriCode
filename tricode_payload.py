@@ -61,44 +61,48 @@ def _decompress_body(body: bytes) -> bytes:
 
 
 def _pick_body(text_body: bytes):
-    best_kind = "raw"
-    best_level = 0
-    best_body = text_body
-    for level in (1, 6, 9):
-        comp = _compress_deflate(text_body, level)
-        if len(comp) < len(best_body):
-            best_kind = "deflate"
-            best_level = level
-            best_body = comp
-    return best_kind, best_level, best_body
+    if len(text_body) < 10:
+        return "raw", 0, text_body
+    # Level 6 first: best balance of speed and ratio
+    comp6 = _compress_deflate(text_body, 6)
+    if len(comp6) >= len(text_body):
+        return "raw", 0, text_body
+    best_body, best_level = comp6, 6
+    # Level 1: faster compression, less shrinkage
+    comp1 = _compress_deflate(text_body, 1)
+    if len(comp1) < len(best_body):
+        best_body, best_level = comp1, 1
+    # Level 9: only worth trying when level-6 already compresses well
+    if len(comp6) < len(text_body) * 0.85:
+        comp9 = _compress_deflate(text_body, 9)
+        if len(comp9) < len(best_body):
+            best_body, best_level = comp9, 9
+    return "deflate", best_level, best_body
 
 
 def _repack_text(text: str, mode: int) -> bytes:
     return struct.pack(">BH", mode, len(text)) + _enc(text, mode)
 
 
-def _dec_an(enc_bytes, char_len):
+def _dec_bits(enc_bytes, char_len, bit_width, char_fn):
     bits = nb = 0
     chars = []
+    mask = (1 << bit_width) - 1
     for b in enc_bytes:
         bits = (bits << 8) | b
         nb += 8
-        while nb >= 6 and len(chars) < char_len:
-            nb -= 6
-            chars.append(_AN[(bits >> nb) & 0x3F])
+        while nb >= bit_width and len(chars) < char_len:
+            nb -= bit_width
+            chars.append(char_fn((bits >> nb) & mask))
     return "".join(chars)
+
+
+def _dec_an(enc_bytes, char_len):
+    return _dec_bits(enc_bytes, char_len, 6, _AN.__getitem__)
 
 
 def _dec_a7(enc_bytes, char_len):
-    bits = nb = 0
-    chars = []
-    for b in enc_bytes:
-        bits = (bits << 8) | b
-        nb += 8
-        while nb >= 7 and len(chars) < char_len:
-            nb -= 7
-            chars.append(chr((bits >> nb) & 0x7F))
-    return "".join(chars)
+    return _dec_bits(enc_bytes, char_len, 7, chr)
 
 
 def build_payload(text, sign_name=None, sign_pw=None, return_meta=False):
@@ -172,7 +176,7 @@ def parse_payload(raw, verify_pw=None):
     elif m == MODE_A7:
         text = _dec_a7(enc_bytes, char_len)
     else:
-        text = enc_bytes.decode("utf-8", "strict")
+        text = enc_bytes.decode("utf-8", "replace")
 
     if _repack_text(text, m) != text_body:
         raise ValueError("payload roundtrip 검증 실패")

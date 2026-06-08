@@ -54,14 +54,28 @@ def render_anchor(corner, cell_px, n90=0):
     """Return anchor image as a grayscale ndarray (cached)."""
     pat = _rotate_pat(ANCHOR_PATTERNS[corner], n90)
     sz = ANCHOR_SIZE * cell_px
-    img = Image.new("L", (sz, sz), 255)
-    d = ImageDraw.Draw(img)
+    arr = np.full((sz, sz), 255, dtype=np.uint8)
+
+    y_l, x_l = np.mgrid[0:cell_px, 0:cell_px]
+    tri_masks = {
+        TRI_UL: y_l < (cell_px - x_l),
+        TRI_UR: y_l <= x_l,
+        TRI_DR: y_l > (cell_px - 1 - x_l),
+        TRI_DL: y_l >= x_l,
+    }
+
     for dr in range(ANCHOR_SIZE):
         for dc in range(ANCHOR_SIZE):
-            x0 = dc * cell_px
-            y0 = dr * cell_px
-            _draw_anchor_cell(d, x0, y0, x0 + cell_px, y0 + cell_px, pat[dr][dc])
-    arr = np.array(img)
+            code = pat[dr][dc]
+            if code == CELL_EMPTY:
+                continue
+            r0, c0 = dr * cell_px, dc * cell_px
+            cell = arr[r0:r0 + cell_px, c0:c0 + cell_px]
+            if code == CELL_FULL:
+                cell[:] = 0
+            elif code in tri_masks:
+                cell[tri_masks[code]] = 0
+
     arr.flags.writeable = False
     return arr
 

@@ -6,6 +6,7 @@ import math
 import os
 import struct
 import zlib
+from functools import lru_cache
 
 CELL_PX = 20
 MARGIN = 2
@@ -90,6 +91,7 @@ MODE_A7 = 2
 MODE_U8 = 3
 
 
+@lru_cache(maxsize=None)
 def codeword_stride(n: int) -> int:
     """Return an invertible permutation stride for a codeword of length n."""
     if n <= 1:
@@ -102,6 +104,7 @@ def codeword_stride(n: int) -> int:
     return stride
 
 
+@lru_cache(maxsize=None)
 def codeword_offset(n: int) -> int:
     """Return a deterministic offset used with the stride permutation."""
     if n <= 1:
@@ -112,6 +115,7 @@ def codeword_offset(n: int) -> int:
     return off
 
 
+@lru_cache(maxsize=None)
 def codeword_permutation(n: int):
     stride = codeword_stride(n)
     off = codeword_offset(n)
@@ -134,6 +138,7 @@ def codeword_permute(data: bytes) -> bytes:
     return bytes(out)
 
 
+@lru_cache(maxsize=None)
 def codeword_permutation_inverse(n: int):
     perm = codeword_permutation(n)
     inv = [0] * n
@@ -142,20 +147,22 @@ def codeword_permutation_inverse(n: int):
     return inv
 
 
-def rs_block_plan(nd: int, nsym: int) -> list:
+@lru_cache(maxsize=None)
+def rs_block_plan(nd: int, nsym: int) -> tuple:
     """총 (nd+nsym) > 255 일 때 다중 RS 블록 구조를 반환. [(data_bytes, ecc_bytes), ...]"""
     total = nd + nsym
     if total <= 255:
-        return [(nd, nsym)]
+        return ((nd, nsym),)
     n_blocks = math.ceil(total / 255)
     base_d, rem_d = divmod(nd, n_blocks)
     base_e, rem_e = divmod(nsym, n_blocks)
-    return [
+    return tuple(
         (base_d + (1 if i < rem_d else 0), base_e + (1 if i < rem_e else 0))
         for i in range(n_blocks)
-    ]
+    )
 
 
+@lru_cache(maxsize=512)
 def ecc_ratio_for_data(n_data: int, signed: bool = False) -> float:
     """
     Adaptive ECC ratio:

@@ -493,7 +493,7 @@ def _decode_upright_pure_python(img: Image.Image, verify_pw=None):
     _, side, cpx, x0, y0 = best
 
     best_parsed = None
-    best_meta = None
+    best_meta = None  # (side_try, cpx_try, x0, y0) — defer dict creation
     best_score = float("-inf")
 
     side_lo = max(6, side - 2)
@@ -501,76 +501,73 @@ def _decode_upright_pure_python(img: Image.Image, verify_pw=None):
     cpx_lo = max(1, cpx - 2)
     cpx_hi = cpx + 2
 
-    for side_try in range(side_lo, side_hi + 1):
-        for cpx_try in range(cpx_lo, cpx_hi + 1):
-            a_px = ANCHOR_SIZE * cpx_try
-            side_px = side_try * cpx_try
-            corners = {
-                "TL": (x0, y0),
-                "TR": (x0 + side_px - a_px, y0),
-                "BL": (x0, y0 + side_px - a_px),
-                "BR": (x0 + side_px - a_px, y0 + side_px - a_px),
-            }
-            if corners["TR"][0] < 0 or corners["BL"][1] < 0:
-                continue
-            if corners["BR"][0] + a_px > arr.shape[1] or corners["BR"][1] + a_px > arr.shape[0]:
-                continue
+    # Sort candidates so best estimate (side, cpx) is tried first
+    _sc_cands = sorted(
+        [(s, c) for s in range(side_lo, side_hi + 1) for c in range(cpx_lo, cpx_hi + 1)],
+        key=lambda sc: abs(sc[0] - side) + abs(sc[1] - cpx),
+    )
 
-            anchors = []
-            for corner, (cx0, cy0) in corners.items():
-                anchors.append(
-                    {
-                        "corner": corner,
-                        "r": int(cy0),
-                        "c": int(cx0),
-                        "w": a_px,
-                        "h": a_px,
-                        "cpx": cpx_try,
-                        "score": 1.0,
-                        "n90": 0,
-                        "cx": float(cx0 + a_px / 2.0),
-                        "cy": float(cy0 + a_px / 2.0),
-                    }
-                )
+    def _make_anchors_rect(side_t, cpx_t, ax0, ay0):
+        a = ANCHOR_SIZE * cpx_t
+        sp = side_t * cpx_t
+        crns = {
+            "TL": (ax0, ay0),
+            "TR": (ax0 + sp - a, ay0),
+            "BL": (ax0, ay0 + sp - a),
+            "BR": (ax0 + sp - a, ay0 + sp - a),
+        }
+        anch = [
+            {"corner": k, "r": int(cy), "c": int(cx), "w": a, "h": a,
+             "cpx": cpx_t, "score": 1.0, "n90": 0,
+             "cx": float(cx + a / 2.0), "cy": float(cy + a / 2.0)}
+            for k, (cx, cy) in crns.items()
+        ]
+        rc = {
+            "quality": "pure-python", "angle": 0.0, "side": side_t, "cpx": cpx_t,
+            "anchors_used": ["TL", "TR", "BL", "BR"],
+            "corners": {k: (float(v[0]), float(v[1])) for k, v in crns.items()},
+        }
+        return anch, rc
 
-            rect = {
-                "quality": "pure-python",
-                "angle": 0.0,
-                "side": side_try,
-                "cpx": cpx_try,
-                "anchors_used": ["TL", "TR", "BL", "BR"],
-                "corners": {k: (float(v[0]), float(v[1])) for k, v in corners.items()},
-            }
+    for side_try, cpx_try in _sc_cands:
+        a_px = ANCHOR_SIZE * cpx_try
+        side_px = side_try * cpx_try
+        tr_x = x0 + side_px - a_px
+        bl_y = y0 + side_px - a_px
+        if tr_x < 0 or bl_y < 0:
+            continue
+        if tr_x + a_px > arr.shape[1] or bl_y + a_px > arr.shape[0]:
+            continue
 
-            try:
-                a_px = ANCHOR_SIZE * cpx_try
-                # Pass TL anchor CENTER (x0, y0 are top-left; center = top-left + half anchor)
-                enc, confs = _decode_raw_from_anchor(arr, side_try, cpx_try,
-                                                     y0 + a_px / 2, x0 + a_px / 2, "TL")
-                parsed = _try_parse_encoded(enc, confs, verify_pw=verify_pw)
-            except Exception:
-                continue
+        try:
+            enc, confs = _decode_raw_from_anchor(arr, side_try, cpx_try,
+                                                 y0 + a_px / 2, x0 + a_px / 2, "TL")
+            parsed = _try_parse_encoded(enc, confs, verify_pw=verify_pw)
+        except Exception:
+            continue
 
-            score = _score_parsed_result(parsed)
-            if _is_plausible_text(parsed):
-                parsed["angle"] = 0.0
-                parsed["side"] = side_try
-                parsed["cpx"] = cpx_try
-                parsed["anchor"] = "TL"
-                parsed["anchors"] = anchors
-                parsed["rect"] = rect
-                enh = arr.copy()
-                binary = (mask.astype(np.uint8) * 255)
-                return parsed, anchors, 0.0, rect, enh, binary
-            if score > best_score:
-                best_score = score
-                best_parsed = parsed
-                best_meta = (anchors, rect, side_try, cpx_try)
+        score = _score_parsed_result(parsed)
+        if _is_plausible_text(parsed):
+            anchors, rect = _make_anchors_rect(side_try, cpx_try, x0, y0)
+            parsed["angle"] = 0.0
+            parsed["side"] = side_try
+            parsed["cpx"] = cpx_try
+            parsed["anchor"] = "TL"
+            parsed["anchors"] = anchors
+            parsed["rect"] = rect
+            enh = arr.copy()
+            binary = (mask.astype(np.uint8) * 255)
+            return parsed, anchors, 0.0, rect, enh, binary
+        if score > best_score:
+            best_score = score
+            best_parsed = parsed
+            best_meta = (side_try, cpx_try, x0, y0)
 
     if best_parsed is None or best_meta is None:
         raise ValueError("payload decode 실패")
 
-    anchors, rect, side_try, cpx_try = best_meta
+    side_try, cpx_try, _x0, _y0 = best_meta
+    anchors, rect = _make_anchors_rect(side_try, cpx_try, _x0, _y0)
     best_parsed["angle"] = 0.0
     best_parsed["side"] = side_try
     best_parsed["cpx"] = cpx_try
@@ -584,7 +581,16 @@ def _decode_upright_pure_python(img: Image.Image, verify_pw=None):
 
 def _try_parse_encoded(enc, confidences, verify_pw=None):
     total_bytes = len(enc)
-    era = [bi for bi in range(total_bytes) if bi * 4 < len(confidences) and min(confidences[bi * 4 : bi * 4 + 4]) <= CONF_THRESH]
+    # Vectorized confidence check: find bytes where any of the 4 dibits is low-confidence
+    if confidences:
+        n = min(total_bytes, len(confidences) // 4)
+        if n > 0:
+            conf_arr = np.array(confidences[:n * 4], dtype=np.int32).reshape(n, 4)
+            era = np.where(conf_arr.min(axis=1) <= CONF_THRESH)[0].tolist()
+        else:
+            era = []
+    else:
+        era = []
 
     for n_data, nsym in _candidate_data_lengths(total_bytes):
         try:

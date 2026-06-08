@@ -4,6 +4,8 @@ GF(2^8) Reed-Solomon — 순수 Python (BM + Forney)
 """
 from functools import lru_cache
 
+import numpy as np
+
 PRIM=0x11d; GF=256
 EXP=[0]*(GF*2); LOG=[0]*GF
 _x=1
@@ -18,6 +20,10 @@ _MUL = [
     bytes((EXP[(LOG[a] + LOG[b]) % (GF - 1)] if a and b else 0) for b in range(GF))
     for a in range(GF)
 ]
+
+# Numpy lookup tables for vectorized GF(2^8) arithmetic
+_MUL_NP = np.frombuffer(b"".join(_MUL), dtype=np.uint8).reshape(256, 256)
+_EXP_NP = np.array(EXP[:256], dtype=np.uint8)
 
 def gm(a,b): return _MUL[a][b]
 def gi(a):   return EXP[(GF-1)-LOG[a]]
@@ -48,8 +54,19 @@ def rs_encode(data:bytes, nsym:int)->bytes:
             for j,gv in enumerate(g[1:],1): m[i+j]^=gm(gv,c)
     return bytes(data)+bytes(m[len(data):])
 
-def _syndromes(msg,ns):
-    return [pe(msg,gp(2,i)) for i in range(ns)]
+def _syndromes(msg, ns):
+    """Compute ns syndromes using vectorized numpy GF(2^8) arithmetic."""
+    msg_arr = np.array(msg, dtype=np.uint8)
+    n = len(msg_arr)
+    if n == 0:
+        return [0] * ns
+    # S[i] = sum_j( msg[j] * alpha^(i*(n-1-j)) )  in GF(2^8), sum = XOR
+    i_arr = np.arange(ns, dtype=np.int32)[:, np.newaxis]          # (ns, 1)
+    exp_pow = np.arange(n - 1, -1, -1, dtype=np.int32)[np.newaxis, :]  # (1, n)
+    ij = (i_arr * exp_pow) % 255                                   # (ns, n)
+    alpha_pows = _EXP_NP[ij]                                       # (ns, n)
+    products = _MUL_NP[msg_arr[np.newaxis, :], alpha_pows]         # (ns, n)
+    return np.bitwise_xor.reduce(products, axis=1).tolist()        # (ns,)
 
 def _bm(S):
     n=len(S); C=[1,0]; B=[1,0]; L=0; m=1; b=1
@@ -86,6 +103,11 @@ def _forney(S,loc,pos,n,ns):
     return mags
 
 class ReedSolomonError(Exception): pass
+
+# Pre-warm generator polynomial cache for common ECC sizes
+for _w in range(4, 65):
+    _gen(_w)
+del _w
 
 def rs_decode(data:bytes, nsym:int)->bytes:
     msg=list(data)
