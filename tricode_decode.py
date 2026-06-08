@@ -411,7 +411,46 @@ def _decode_raw_from_anchor(arr, side, cpx_f, r_anchor_center, c_anchor_center, 
     return _dibits_to_bytes(dibits.tolist()), confs.tolist()
 
 
-def _decode_upright_pure_python(img: Image.Image, verify_pw=None, _rotation_corrected=False):
+def _fast_estimate_cpx(arr_gray: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> int:
+    """QR-style cell-size estimate via column/row edge-density autocorrelation.
+
+    Finds the grid period (= cpx) in O(n) by locating the dominant peak in the
+    autocorrelation of the horizontal/vertical edge profile.  Works reliably for
+    clean digital images and slight tilts (≲2°).  Returns 0 when the peak is not
+    strong enough — callers should fall back to the full side-scan in that case.
+    """
+    region = arr_gray[max(0, y0):min(arr_gray.shape[0], y1 + 1),
+                      max(0, x0):min(arr_gray.shape[1], x1 + 1)]
+    if region.shape[0] < 16 or region.shape[1] < 16:
+        return 0
+
+    best_cpx, best_v = 0, 0.0
+    # Try both horizontal-edge → column profile and vertical-edge → row profile
+    for edges in (
+        np.abs(region[1:].astype(np.float32) - region[:-1].astype(np.float32)).sum(axis=0),
+        np.abs(region[:, 1:].astype(np.float32) - region[:, :-1].astype(np.float32)).sum(axis=1),
+    ):
+        profile = edges.astype(np.float64)
+        profile -= profile.mean()
+        n = len(profile)
+        if n < 16:
+            continue
+        corr = np.correlate(profile, profile, mode='full')[n - 1:]
+        if corr[0] <= 0:
+            continue
+        corr = corr / corr[0]
+        max_lag = min(60, n // 3)
+        if max_lag < 4:
+            continue
+        peak_idx = int(np.argmax(corr[4:max_lag + 1]))
+        v = float(corr[4 + peak_idx])
+        if v > best_v and v > 0.40:  # strong-correlation threshold
+            best_v = v
+            best_cpx = 4 + peak_idx
+    return best_cpx if best_cpx >= 4 else 0
+
+
+def _decode_upright_pure_python(img: Image.Image, verify_pw=None):
     """Decode a clean upright Tricode image without cv2."""
     arr = np.array(img.convert("L"))
     thr = _otsu_threshold(arr)
@@ -471,59 +510,84 @@ def _decode_upright_pure_python(img: Image.Image, verify_pw=None, _rotation_corr
     if bw < 40 or bh < 40:
         raise ValueError("TriQR 영역이 너무 작습니다")
 
-    best = None  # (score, side, cpx, x0, y0, n90)
+    # ── QR-style fast cpx estimation ──────────────────────────────────────────
+    # Use edge-density autocorrelation (O(n)) to find the grid period.  When it
+    # succeeds those candidates are pushed to the FRONT so we find the right
+    # (side, cpx) on the first try.  The full deduped scan always follows so we
+    # never miss the correct pair if the autocorr estimate is wrong.
+    cpx_est = _fast_estimate_cpx(arr, x0, y0, x1, y1)
+    seen_pairs: set = set()
+    search_pairs = []
+
+    if cpx_est >= 4:
+        side_est = round(min(bw, bh) / cpx_est)
+        for s in range(max(6, side_est - 3), min(41, side_est + 4)):
+            for c in range(max(4, cpx_est - 2), cpx_est + 3):
+                if abs(s * c - bw) <= max(3, c) and abs(s * c - bh) <= max(3, c):
+                    seen_pairs.add((s, c))
+                    search_pairs.append((s, c))
+
+    # Full deduped scan (always runs — autocorr candidates already at front)
+    seen_cpx: set = set()
     for side in range(6, 41):
         cpx = max(1, round(min(bw, bh) / side))
         if cpx < 4:
             continue
-        if abs(side * cpx - bw) > max(3, cpx):
+        if abs(side * cpx - bw) > max(3, cpx) or abs(side * cpx - bh) > max(3, cpx):
             continue
-        if abs(side * cpx - bh) > max(3, cpx):
-            continue
+        if cpx not in seen_cpx:
+            seen_cpx.add(cpx)
+            if (side, cpx) not in seen_pairs:
+                seen_pairs.add((side, cpx))
+                search_pairs.append((side, cpx))
 
+    best = None  # (score, side, cpx, x0, y0)
+    for side, cpx in search_pairs:
         a_px = ANCHOR_SIZE * cpx
         if x0 + a_px > arr.shape[1] or y0 + a_px > arr.shape[0]:
             continue
 
-        for n90 in range(4):  # 0°/90°/180°/270° 회전 앵커 패턴 모두 시도
-            score = 0.0
-            ok = True
-            for corner in ("TL", "TR", "BL", "BR"):
-                if corner == "TL":
-                    cx0, cy0 = x0, y0
-                elif corner == "TR":
-                    cx0, cy0 = x1 - a_px + 1, y0
-                elif corner == "BL":
-                    cx0, cy0 = x0, y1 - a_px + 1
-                else:
-                    cx0, cy0 = x1 - a_px + 1, y1 - a_px + 1
+        # n90=0 only: this function expects an upright image.
+        # 90°/180°/270° rotations are handled at the decode_image level.
+        score = 0.0
+        ok = True
+        _cs = {}
+        for corner in ("TL", "TR", "BL", "BR"):
+            if corner == "TL":
+                cx0, cy0 = x0, y0
+            elif corner == "TR":
+                cx0, cy0 = x1 - a_px + 1, y0
+            elif corner == "BL":
+                cx0, cy0 = x0, y1 - a_px + 1
+            else:
+                cx0, cy0 = x1 - a_px + 1, y1 - a_px + 1
 
-                if cx0 < 0 or cy0 < 0 or cx0 + a_px > arr.shape[1] or cy0 + a_px > arr.shape[0]:
-                    ok = False
-                    break
+            if cx0 < 0 or cy0 < 0 or cx0 + a_px > arr.shape[1] or cy0 + a_px > arr.shape[0]:
+                ok = False
+                break
 
-                crop = arr[cy0 : cy0 + a_px, cx0 : cx0 + a_px]
-                tmpl = render_anchor(corner, cpx, n90)
-                score += _template_match_score(crop, tmpl)
+            crop = arr[cy0 : cy0 + a_px, cx0 : cx0 + a_px]
+            tmpl = render_anchor(corner, cpx, 0)
+            s = _template_match_score(crop, tmpl)
+            _cs[corner] = s
+            score += s
 
-            if not ok:
-                continue
+        if not ok:
+            continue
 
-            avg = score / 4.0
-            if best is None or avg > best[0]:
-                best = (avg, side, cpx, x0, y0, n90)
+        avg = score / 4.0
+        if best is None or avg > best[0]:
+            _others = (_cs.get("TR", 0.0) + _cs.get("BL", 0.0) + _cs.get("BR", 0.0)) / 3.0
+            best = (avg, side, cpx, x0, y0, _cs.get("TL", 0.0), _others)
 
     if best is None:
         raise ValueError("TriQR 앵커를 판독하지 못했습니다")
 
-    _, side, cpx, x0, y0, n90 = best
-
-    # 90°·180°·270° 회전이 감지된 경우: 이미지를 보정 후 재시도 (재귀 1회 한정)
-    if n90 != 0 and not _rotation_corrected:
-        _fill = (255, 255, 255) if img.mode == "RGB" else 255
-        # n90=1 → 이미지 90°CW 회전됨 → PIL.rotate(-90) 로 복원
-        corrected = img.rotate(-n90 * 90, expand=True, fillcolor=_fill)
-        return _decode_upright_pure_python(corrected, verify_pw=verify_pw, _rotation_corrected=True)
+    best_anchor_score, side, cpx, x0, y0, _tl_score, _others_avg = best
+    # Anchor damage: TL is specifically bad while the other 3 corners are fine.
+    # In this case try TR/BL/BR as decode origin. For wrong orientation (all
+    # corners score low) this stays False so we skip the expensive fallbacks.
+    _anchor_damage_likely = _tl_score < 0.55 and _others_avg >= 0.75
 
     best_parsed = None
     best_meta = None  # (side_try, cpx_try, x0, y0) — defer dict creation
@@ -539,6 +603,11 @@ def _decode_upright_pure_python(img: Image.Image, verify_pw=None, _rotation_corr
         [(s, c) for s in range(side_lo, side_hi + 1) for c in range(cpx_lo, cpx_hi + 1)],
         key=lambda sc: abs(sc[0] - side) + abs(sc[1] - cpx),
     )
+    # When anchor match is weak (wrong orientation/scale), skip large payloads.
+    # A weak match + large enc_len → certainly wrong → avoids 400ms+ RS decode.
+    # Threshold: anchor score < 0.75 AND enc would exceed ~100 bytes.
+    _skip_large_enc = best_anchor_score < 0.75
+    _LARGE_ENC = 100
 
     def _make_anchors_rect(side_t, cpx_t, ax0, ay0):
         a = ANCHOR_SIZE * cpx_t
@@ -572,29 +641,43 @@ def _decode_upright_pure_python(img: Image.Image, verify_pw=None, _rotation_corr
         if tr_x + a_px > arr.shape[1] or bl_y + a_px > arr.shape[0]:
             continue
 
-        try:
-            enc, confs = _decode_raw_from_anchor(arr, side_try, cpx_try,
-                                                 y0 + a_px / 2, x0 + a_px / 2, "TL")
-            parsed = _try_parse_encoded(enc, confs, verify_pw=verify_pw)
-        except Exception:
-            continue
+        # Try all 4 corners as decode reference — damaged anchors auto-recovery.
+        # TL is tried first (fastest path); TR/BL/BR are fallbacks used when the
+        # TL region is corrupted and produces an unreadable payload.
+        _corner_refs = (
+            ("TL", y0 + a_px / 2.0,       x0 + a_px / 2.0),
+            ("TR", y0 + a_px / 2.0,       x0 + side_px - a_px / 2.0),
+            ("BL", y0 + side_px - a_px / 2.0, x0 + a_px / 2.0),
+            ("BR", y0 + side_px - a_px / 2.0, x0 + side_px - a_px / 2.0),
+        )
+        for _anchor_corner, _ac_r, _ac_c in _corner_refs:
+            # Only try TR/BL/BR when TL is specifically damaged (not just wrong orientation).
+            if _anchor_corner != "TL" and not _anchor_damage_likely:
+                break
+            try:
+                enc, confs = _decode_raw_from_anchor(arr, side_try, cpx_try, _ac_r, _ac_c, _anchor_corner)
+                if _skip_large_enc and len(enc) > _LARGE_ENC:
+                    continue
+                parsed = _try_parse_encoded(enc, confs, verify_pw=verify_pw)
+            except Exception:
+                continue
 
-        score = _score_parsed_result(parsed)
-        if _is_plausible_text(parsed):
-            anchors, rect = _make_anchors_rect(side_try, cpx_try, x0, y0)
-            parsed["angle"] = 0.0
-            parsed["side"] = side_try
-            parsed["cpx"] = cpx_try
-            parsed["anchor"] = "TL"
-            parsed["anchors"] = anchors
-            parsed["rect"] = rect
-            enh = arr.copy()
-            binary = (mask.astype(np.uint8) * 255)
-            return parsed, anchors, 0.0, rect, enh, binary
-        if score > best_score:
-            best_score = score
-            best_parsed = parsed
-            best_meta = (side_try, cpx_try, x0, y0)
+            score = _score_parsed_result(parsed)
+            if _is_plausible_text(parsed):
+                anchors, rect = _make_anchors_rect(side_try, cpx_try, x0, y0)
+                parsed["angle"] = 0.0
+                parsed["side"] = side_try
+                parsed["cpx"] = cpx_try
+                parsed["anchor"] = _anchor_corner
+                parsed["anchors"] = anchors
+                parsed["rect"] = rect
+                enh = arr.copy()
+                binary = (mask.astype(np.uint8) * 255)
+                return parsed, anchors, 0.0, rect, enh, binary
+            if score > best_score:
+                best_score = score
+                best_parsed = parsed
+                best_meta = (side_try, cpx_try, x0, y0)
 
     if best_parsed is None or best_meta is None:
         raise ValueError("payload decode 실패")
@@ -784,9 +867,10 @@ def decode_image(img: Image.Image, templates=None, thresh=0.55, photo_mode=False
             pass
         _fill = (255, 255, 255) if img.mode == "RGB" else 255
         _best = None
-        for _ang in (-1, 1, -2, 2, -3, 3, -5, 5, -7, 7, -10, 10, -15, 15):
+
+        def _try_rot(rotated):
+            nonlocal _best
             try:
-                rotated = img.rotate(-_ang, expand=True, fillcolor=_fill)
                 _res = _decode_upright_pure_python(rotated, verify_pw=verify_pw)
                 _text = _res[0].get("text", "") if isinstance(_res, tuple) else _res.get("text", "")
                 if _text:
@@ -794,7 +878,21 @@ def decode_image(img: Image.Image, templates=None, thresh=0.55, photo_mode=False
                 if _best is None:
                     _best = _res
             except ValueError:
-                continue
+                pass
+            return None
+
+        # Exact 90°/180°/270° first — cheap and handles camera/display orientations
+        for _exact in (90, 180, 270):
+            _r = _try_rot(img.rotate(_exact, expand=True, fillcolor=_fill))
+            if _r is not None:
+                return _r
+
+        # Fine-angle sweep for slight tilts (±1° … ±45°)
+        for _ang in (-1, 1, -2, 2, -3, 3, -5, 5, -7, 7, -10, 10, -15, 15, -20, 20, -30, 30, -45, 45):
+            _r = _try_rot(img.rotate(-_ang, expand=True, fillcolor=_fill))
+            if _r is not None:
+                return _r
+
         if _best is not None:
             return _best
         raise ValueError("복호 실패 (회전 보정 포함)")
