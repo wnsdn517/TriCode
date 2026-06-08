@@ -181,6 +181,20 @@ def test_partial_damage():
     _check(r, text)
 
 
+def test_anchor_damage():
+    """Destroy one corner anchor entirely; decoder should fall back to the other 3."""
+    from tricode_common import ANCHOR_SIZE, CELL_PX, MARGIN
+    text = TEXTS[0]
+    img = _encode(text)
+    arr = np.array(img.convert("L"))
+    # Locate TL anchor region and wipe it with white
+    margin_px = MARGIN * CELL_PX
+    anchor_px = ANCHOR_SIZE * CELL_PX
+    arr[margin_px : margin_px + anchor_px, margin_px : margin_px + anchor_px] = 255
+    r = _decode(Image.fromarray(arr))
+    _check(r, text)
+
+
 # ── 5. authentication ─────────────────────────────────────────────────────────
 
 def _ensure_users():
@@ -277,7 +291,8 @@ if __name__ == "__main__":
         ("Scale transforms",    [test_scale_down, test_scale_up]),
         ("Rotation",            [test_rotation_small, test_rotation_medium]),
         ("Noise / corruption",  [test_salt_and_pepper, test_gaussian_blur,
-                                  test_jpeg_compression, test_partial_damage]),
+                                  test_jpeg_compression, test_partial_damage,
+                                  test_anchor_damage]),
         ("Authentication",      [test_sign_and_verify, test_sign_wrong_pw,
                                   test_two_users, test_sign_with_noise]),
         ("Combined stress",     [test_combined_scale_noise]),
